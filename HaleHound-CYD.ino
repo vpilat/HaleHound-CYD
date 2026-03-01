@@ -120,8 +120,8 @@ const unsigned char *wifi_submenu_icons[NUM_SUBMENU_ITEMS] = {
     bitmap_icon_go_back
 };
 
-// Bluetooth Submenu - 8 items
-const int bluetooth_NUM_SUBMENU_ITEMS = 8;
+// Bluetooth Submenu - 9 items
+const int bluetooth_NUM_SUBMENU_ITEMS = 9;
 const char *bluetooth_submenu_items[bluetooth_NUM_SUBMENU_ITEMS] = {
     "BLE Jammer",
     "BLE Spoofer",
@@ -130,6 +130,7 @@ const char *bluetooth_submenu_items[bluetooth_NUM_SUBMENU_ITEMS] = {
     "BLE Scanner",
     "WhisperPair",
     "AirTag Detect",
+    "Tracker Detect",
     "Back to Main Menu"
 };
 
@@ -141,6 +142,7 @@ const unsigned char *bluetooth_submenu_icons[bluetooth_NUM_SUBMENU_ITEMS] = {
     bitmap_icon_graph,
     bitmap_icon_eye,
     bitmap_icon_apple,
+    bitmap_icon_scanner,
     bitmap_icon_go_back
 };
 
@@ -755,7 +757,7 @@ void handleBluetoothSubmenuTouch() {
             displaySubmenu();
             delay(200);
 
-            if (current_submenu_index == 7) { // Back
+            if (current_submenu_index == 8) { // Back
                 returnToMainMenu();
                 return;
             }
@@ -838,6 +840,15 @@ void handleBluetoothSubmenuTouch() {
                         if (digitalRead(0) == LOW) feature_exit_requested = true;
                     }
                     AirTagDetect::cleanup();
+                    break;
+                case 7: // Tracker Detect (Multi-platform)
+                    TrackerDetect::setup();
+                    while (!feature_exit_requested) {
+                        TrackerDetect::loop();
+                        if (TrackerDetect::isExitRequested()) feature_exit_requested = true;
+                        if (digitalRead(0) == LOW) feature_exit_requested = true;
+                    }
+                    TrackerDetect::cleanup();
                     break;
             }
 

@@ -199,6 +199,28 @@ void cleanup();
 }  // namespace AirTagDetect
 
 // ═══════════════════════════════════════════════════════════════════════════
+// TRACKER DETECT - Multi-Platform Tracker Detection
+// Scans for Google FMDN (0xFEAA), Samsung SmartTag (0xFD5A), Tile (0xFEED),
+// Chipolo (0xFE33), and Apple AirTag (0x004C) trackers via BLE advertisements
+// ═══════════════════════════════════════════════════════════════════════════
+
+namespace TrackerDetect {
+
+// Initialize detector and start scanning
+void setup();
+
+// Main loop function
+void loop();
+
+// Check if user requested exit
+bool isExitRequested();
+
+// Cleanup and release BLE resources
+void cleanup();
+
+}  // namespace TrackerDetect
+
+// ═══════════════════════════════════════════════════════════════════════════
 // BLE JAMMER - 2.4GHz BLE Jammer using NRF24L01+PA+LNA
 // Continuous carrier wave jamming on Bluetooth 2.402-2.480 GHz
 // Modes: ALL CHANNELS | ADV ONLY (Ch37/38/39) | DATA ONLY
