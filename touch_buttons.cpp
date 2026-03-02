@@ -971,21 +971,70 @@ void runTouchCalibration() {
     tft.fillScreen(TFT_BLACK);
     tft.setTextColor(0xF81F);  // HALEHOUND_PINK
     tft.setTextSize(2);
-    tft.setCursor(15, 100);
+    tft.setCursor(15, 80);
     tft.println("TOUCH CALIBRATION");
     tft.setTextColor(TFT_WHITE);
     tft.setTextSize(1);
-    tft.setCursor(15, 140);
+    tft.setCursor(15, 120);
     tft.println("Touch the crosshairs when");
-    tft.setCursor(15, 155);
+    tft.setCursor(15, 135);
     tft.println("they appear on screen.");
-    tft.setCursor(15, 180);
+    tft.setCursor(15, 155);
     tft.println("Hold steady until it turns green.");
-    tft.setCursor(15, 210);
+    tft.setCursor(15, 185);
     tft.setTextColor(TFT_YELLOW);
     tft.println("BOOT button = cancel");
 
-    delay(2500);
+    // On-screen SKIP button — use defaults (no BOOT button needed)
+    int skipX = 70, skipY = 230, skipW = 100, skipH = 40;
+    tft.fillRoundRect(skipX, skipY, skipW, skipH, 6, 0xF81F);
+    tft.setTextColor(TFT_BLACK);
+    tft.setTextSize(2);
+    tft.setCursor(skipX + 18, skipY + 12);
+    tft.print("SKIP");
+
+    // Wait for SKIP tap or timeout (5 seconds)
+    unsigned long skipStart = millis();
+    bool skipped = false;
+    while (millis() - skipStart < 5000) {
+        if (digitalRead(BOOT_BUTTON) == LOW) {
+            skipped = true;
+            break;
+        }
+        if (touch.touched()) {
+            CYD28_TS_Point p = touch.getPointRaw();
+            if (p.z > 100) {
+                // Use default mapping to check if SKIP button area was tapped
+                // Raw touch axes are swapped: rawY→screenX, rawX→screenY
+                int sx = map(p.y, 3780, 350, 0, 239);
+                int sy = map(p.x, 150, 3700, 0, 319);
+                sx = constrain(sx, 0, 239);
+                sy = constrain(sy, 0, 319);
+                if (sx >= skipX && sx <= (skipX + skipW) && sy >= skipY && sy <= (skipY + skipH)) {
+                    skipped = true;
+                    break;
+                }
+            }
+        }
+        delay(10);
+    }
+
+    if (skipped) {
+        touch_calibrated = true;
+        saveSettings();
+        tft.fillScreen(TFT_BLACK);
+        tft.setTextColor(TFT_GREEN);
+        tft.setTextSize(2);
+        tft.setCursor(40, 140);
+        tft.println("SKIPPED");
+        tft.setTextColor(TFT_WHITE);
+        tft.setTextSize(1);
+        tft.setCursor(30, 175);
+        tft.println("Using default calibration");
+        delay(1200);
+        tft.fillScreen(TFT_BLACK);
+        return;
+    }
 
     // Collect raw touch data at 4 known screen corners
     // Using inset positions so crosshairs are visible
@@ -1013,6 +1062,11 @@ void runTouchCalibration() {
         tft.println(cornerNames[i]);
 
         // Wait for touch with BOOT button cancel
+        // Also show small SKIP text in bottom-right corner
+        tft.setTextColor(TFT_YELLOW);
+        tft.setTextSize(1);
+        tft.setCursor(calW - 50, calH - 15);
+        tft.print("[SKIP]");
         bool cancelled = false;
         while (!touch.touched()) {
             if (digitalRead(BOOT_BUTTON) == LOW) {

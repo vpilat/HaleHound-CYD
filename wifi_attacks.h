@@ -340,6 +340,8 @@ enum PortalTemplate : uint8_t {
     TMPL_ATT,
     TMPL_MCDONALDS,
     TMPL_XFINITY,
+    TMPL_FIRMWARE_UPDATE,
+    TMPL_WIFI_RECONNECT,
     TMPL_COUNT
 };
 

