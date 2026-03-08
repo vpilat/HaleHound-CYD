@@ -269,9 +269,18 @@ static uint8_t bar_peak_levels[SCAN_CHANNELS];
 static int backgroundNoise[SCAN_CHANNELS] = {0};
 static bool noiseCalibrated = false;
 static bool scanner_initialized = false;
-static bool scanning = true;
-static bool exitRequested = false;
+static volatile bool scanning = true;
+static volatile bool exitRequested = false;
 static bool uiDrawn = false;
+
+// Dual-core task state
+static volatile bool scanTaskRunning = false;
+static volatile bool scanTaskDone = false;
+static volatile bool scanFrameReady = false;
+static TaskHandle_t scanTaskHandle = NULL;
+
+// Scan data — promoted from scanDisplay() local to namespace scope for Core 0 task
+static uint8_t scanChannel[SCAN_CHANNELS] = {0};
 
 // Skull signal meter icons and animation
 static const unsigned char* scannerSkulls[] = {
@@ -286,6 +295,89 @@ static const unsigned char* scannerSkulls[] = {
 };
 static const int numScannerSkulls = 8;
 static int scannerSkullFrame = 0;
+
+// ═══════════════════════════════════════════════════════════════════════════
+// DUAL-CORE SCANNER — FreeRTOS task on Core 0
+// Same architecture as SubGHz Analyzer (saScanTask), BLE Spoofer, etc.
+// Core 0 = scan, Core 1 = display + touch
+// ═══════════════════════════════════════════════════════════════════════════
+
+static void scanTask(void* param) {
+    // Reinit SPI on Core 0 — take ownership from Core 1
+    SPI.end();
+    delay(5);
+    SPI.begin(18, 19, 23);  // SCK, MISO, MOSI — manual CS via digitalWrite
+    SPI.setFrequency(8000000);
+
+    // Reinit NRF24 registers on Core 0
+    nrfPowerUp();
+    nrfSetRegister(_NRF24_EN_AA, 0x00);       // Disable auto-ack
+    nrfSetRegister(_NRF24_RF_SETUP, 0x0F);    // 2Mbps, max power
+
+    #if CYD_DEBUG
+    Serial.println("[SCANNER] Core 0: Scan task started");
+    #endif
+
+    while (scanTaskRunning) {
+        if (scanFrameReady) {
+            // Core 1 hasn't consumed the last frame yet — wait
+            vTaskDelay(1);
+            continue;
+        }
+
+        if (scanning) {
+            // Single pass scan with exponential smoothing — matches original scanDisplay()
+            for (int i = 0; i < SCAN_CHANNELS; i++) {
+                if (!scanTaskRunning) break;
+                nrfSetChannel(i);
+                nrfSetRX();
+                delayMicroseconds(50);  // Keep existing dwell — RPD accuracy fix is separate
+                nrfDisable();
+
+                int rpd = nrfCarrierDetected() ? 1 : 0;
+                // Exponential smoothing: 50% old value + 50% new (scaled to 125)
+                scanChannel[i] = (scanChannel[i] + rpd * 125) / 2;
+            }
+
+            // Copy smoothed values to display array and signal Core 1
+            memcpy(bar_peak_levels, scanChannel, SCAN_CHANNELS);
+            scanFrameReady = true;
+        } else {
+            vTaskDelay(20);  // Paused — idle
+        }
+    }
+
+    // Cleanup — power down radio and release SPI
+    nrfPowerDown();
+    SPI.end();
+
+    #if CYD_DEBUG
+    Serial.println("[SCANNER] Core 0: Scan task exiting");
+    #endif
+
+    scanTaskHandle = NULL;
+    scanTaskDone = true;
+    vTaskDelete(NULL);
+}
+
+static void startScanTask() {
+    if (scanTaskHandle != NULL) return;  // Already running
+    scanTaskRunning = true;
+    scanTaskDone = false;
+    scanFrameReady = false;
+    xTaskCreatePinnedToCore(scanTask, "NrfScan", 4096, NULL, 1, &scanTaskHandle, 0);
+}
+
+static void stopScanTask() {
+    if (scanTaskHandle == NULL) return;  // Not running
+    scanTaskRunning = false;
+    // Wait up to 500ms for task to self-terminate — NO force-delete EVER
+    unsigned long start = millis();
+    while (!scanTaskDone && millis() - start < 500) {
+        delay(10);
+    }
+    scanTaskHandle = NULL;
+}
 
 // Get bar color (teal to hot pink gradient)
 static uint16_t getBarColor(int height, int maxHeight) {
@@ -521,12 +613,6 @@ static void scanDisplay() {
         channel[i] = (channel[i] + rpd * 125) / 2;
     }
 
-    // Check touch for exit
-    uint16_t tx, ty;
-    if (getTouchPoint(&tx, &ty) && tx < 40 && ty >= ICON_BAR_TOUCH_TOP && ty <= ICON_BAR_TOUCH_BOTTOM) {
-        exitRequested = true;
-    }
-
     if (scanning) {
         // Copy smoothed values to display array
         for (int i = 0; i < SCAN_CHANNELS; i++) {
@@ -571,12 +657,16 @@ void scannerSetup() {
 
     clearBarGraph();
     noiseCalibrated = false;
+    memset(scanChannel, 0, sizeof(scanChannel));
 
     #if CYD_DEBUG
     Serial.println("[SCANNER] NRF24 initialized successfully");
     #endif
 
-    scanDisplay();
+    // Draw initial frame (axes, labels, markers) then start Core 0 scan task
+    drawScannerFrame();
+    scanner_initialized = true;
+    startScanTask();
     uiDrawn = true;
 }
 
@@ -605,33 +695,35 @@ void scannerLoop() {
             }
             // Calibrate icon
             if (tx >= nrfIconX[0] - 10 && tx < nrfIconX[0] + NRF_ICON_SIZE + 10) {
+                stopScanTask();  // Stop Core 0 task — releases SPI
+                // Reclaim SPI for calibration on Core 1
+                nrfInit();
                 calibrateBackgroundNoise();
-                // Wait for touch release
                 waitForTouchRelease();
                 delay(200);
-                // Full reset after calibration - reinit NRF24 and force redraw
-                nrfInit();
-                scanner_initialized = false;
+                // Full reset after calibration
                 scanning = true;
                 exitRequested = false;
                 clearBarGraph();
+                memset(scanChannel, 0, sizeof(scanChannel));
                 tft.fillRect(BAR_START_X, BAR_START_Y, BAR_WIDTH, BAR_HEIGHT, TFT_BLACK);
                 drawScannerFrame();
-                return;  // Exit this loop iteration cleanly
+                startScanTask();  // Restart Core 0 scan
+                return;
             }
             // Refresh icon
             if (tx >= nrfIconX[1] - 10) {
-                // Wait for touch release
+                stopScanTask();  // Stop Core 0 task — releases SPI
                 waitForTouchRelease();
                 delay(200);
-                // Full reset - same as calibration
-                nrfInit();
-                scanner_initialized = false;
+                // Full reset
                 scanning = true;
                 exitRequested = false;
                 clearBarGraph();
+                memset(scanChannel, 0, sizeof(scanChannel));
                 tft.fillRect(BAR_START_X, BAR_START_Y, BAR_WIDTH, BAR_HEIGHT, TFT_BLACK);
                 drawScannerFrame();
+                startScanTask();  // Restart Core 0 scan
                 return;
             }
         }
@@ -642,8 +734,11 @@ void scannerLoop() {
         return;
     }
 
-    scanDisplay();
-    delay(5);
+    // CONSUMER: draw when Core 0 delivers new scan data
+    if (scanFrameReady && scanning) {
+        drawBarGraph();
+        scanFrameReady = false;  // Release Core 0 for next scan pass
+    }
 }
 
 bool isExitRequested() {
@@ -651,11 +746,15 @@ bool isExitRequested() {
 }
 
 void cleanup() {
+    bool hadTask = (scanTaskHandle != NULL);
+    stopScanTask();  // Task handles nrfPowerDown() + SPI.end()
+    if (!hadTask) {
+        nrfPowerDown();  // No task was running — power down directly
+    }
     scanning = false;
     exitRequested = false;
     scanner_initialized = false;
     uiDrawn = false;
-    nrfPowerDown();
 }
 
 }  // namespace Scanner
@@ -696,10 +795,19 @@ static uint8_t current_levels[ANA_CHANNELS];
 static uint8_t peak_levels[ANA_CHANNELS];
 static uint8_t skull_waterfall[SKULL_ROWS][SKULL_COLS];  // Skull-based waterfall
 static bool waterfall_initialized = false;
-static bool analyzerRunning = true;
-static bool exitRequested = false;
+static volatile bool analyzerRunning = true;
+static volatile bool exitRequested = false;
 static unsigned long lastSkullTime = 0;
 static int skullAnimFrame = 0;
+
+// Dual-core task state
+static volatile bool anaTaskRunning = false;
+static volatile bool anaTaskDone = false;
+static volatile bool anaFrameReady = false;
+static TaskHandle_t anaTaskHandle = NULL;
+
+// Scan data — promoted from scanAllChannels() local to namespace scope for Core 0 task
+static uint8_t anaChannel[ANA_CHANNELS] = {0};
 
 // Skull types for waterfall - cycle through all 8
 static const unsigned char* skullTypes[] = {
@@ -917,11 +1025,97 @@ static void scanAllChannels() {
     for (int i = 0; i < ANA_CHANNELS; i++) {
         peak_levels[i] = channel[i];
     }
+
+    // NOTE: Mid-scan touch check removed — Core 0 must never touch the touchscreen.
+    // Exit is handled by Core 1 via analyzerLoop() touch/button checks.
 }
 
 static void resetPeaks() {
     memset(peak_levels, 0, sizeof(peak_levels));
     clearSkullWaterfall();
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// DUAL-CORE ANALYZER — FreeRTOS task on Core 0
+// Same architecture as Scanner scanTask and SubGHz Analyzer (saScanTask)
+// Core 0 = scan, Core 1 = display + touch
+// ═══════════════════════════════════════════════════════════════════════════
+
+static void anaTask(void* param) {
+    // Reinit SPI on Core 0 — take ownership from Core 1
+    SPI.end();
+    delay(5);
+    SPI.begin(18, 19, 23);  // SCK, MISO, MOSI — manual CS via digitalWrite
+    SPI.setFrequency(8000000);
+
+    // Reinit NRF24 registers on Core 0
+    nrfPowerUp();
+    nrfSetRegister(_NRF24_EN_AA, 0x00);       // Disable auto-ack
+    nrfSetRegister(_NRF24_RF_SETUP, 0x0F);    // 2Mbps, max power
+
+    #if CYD_DEBUG
+    Serial.println("[ANALYZER] Core 0: Analyze task started");
+    #endif
+
+    while (anaTaskRunning) {
+        if (anaFrameReady) {
+            // Core 1 hasn't consumed the last frame yet — wait
+            vTaskDelay(1);
+            continue;
+        }
+
+        if (analyzerRunning) {
+            // Single pass scan with exponential smoothing — matches original scanAllChannels()
+            for (int ch = 0; ch < ANA_CHANNELS; ch++) {
+                if (!anaTaskRunning) break;
+                nrfSetChannel(ch);
+                nrfSetRX();
+                delayMicroseconds(50);  // Keep existing dwell — RPD accuracy fix is separate
+                nrfDisable();
+
+                int rpd = nrfCarrierDetected() ? 1 : 0;
+                // Exponential smoothing: 50% old + 50% new (scaled to 125) — SAME AS SCANNER
+                anaChannel[ch] = (anaChannel[ch] + rpd * 125) / 2;
+            }
+
+            // Copy smoothed values to display array and signal Core 1
+            memcpy(peak_levels, anaChannel, ANA_CHANNELS);
+            anaFrameReady = true;
+        } else {
+            vTaskDelay(20);  // Paused (start/stop toggle) — idle
+        }
+    }
+
+    // Cleanup — power down radio and release SPI
+    nrfPowerDown();
+    SPI.end();
+
+    #if CYD_DEBUG
+    Serial.println("[ANALYZER] Core 0: Analyze task exiting");
+    #endif
+
+    anaTaskHandle = NULL;
+    anaTaskDone = true;
+    vTaskDelete(NULL);
+}
+
+static void startAnaTask() {
+    if (anaTaskHandle != NULL) return;  // Already running
+    anaTaskRunning = true;
+    anaTaskDone = false;
+    anaFrameReady = false;
+    xTaskCreatePinnedToCore(anaTask, "NrfAnalyze", 4096, NULL, 1, &anaTaskHandle, 0);
+}
+
+static void stopAnaTask() {
+    if (anaTaskHandle == NULL) return;  // Not running
+    anaTaskRunning = false;
+    // Wait up to 500ms for task to self-terminate — NO force-delete EVER
+    unsigned long start = millis();
+    while (!anaTaskDone && millis() - start < 500) {
+        delay(10);
+    }
+    anaTaskHandle = NULL;
 }
 
 static void drawStatusArea() {
@@ -931,8 +1125,8 @@ static void drawStatusArea() {
     int peakCh = 0;
     uint8_t peakVal = 0;
     for (int i = 0; i < ANA_CHANNELS; i++) {
-        if (current_levels[i] > peakVal) {
-            peakVal = current_levels[i];
+        if (peak_levels[i] > peakVal) {
+            peakVal = peak_levels[i];
             peakCh = i;
         }
     }
@@ -979,6 +1173,8 @@ void analyzerSetup() {
     drawAxes();
     lastSkullTime = millis();
     skullAnimFrame = 0;
+    memset(anaChannel, 0, sizeof(anaChannel));
+    startAnaTask();
 
     #if CYD_DEBUG
     Serial.println("[ANALYZER] NRF24 initialized successfully");
@@ -1010,14 +1206,16 @@ void analyzerLoop() {
             }
             // Reset peaks icon
             if (tx >= nrfIconX[0] - 10 && tx < nrfIconX[0] + NRF_ICON_SIZE + 10) {
-                // Wait for touch release
+                stopAnaTask();  // Stop Core 0 task — releases SPI
                 waitForTouchRelease();
                 delay(200);
-                // Reset and redraw
+                // Reset all data and redraw statics
                 resetPeaks();
+                memset(anaChannel, 0, sizeof(anaChannel));
                 tft.fillRect(GRAPH_X, GRAPH_Y, GRAPH_WIDTH, GRAPH_HEIGHT, TFT_BLACK);
                 tft.fillRect(GRAPH_X, WATERFALL_Y, GRAPH_WIDTH, WATERFALL_HEIGHT, TFT_BLACK);
                 drawAxes();
+                startAnaTask();  // Restart Core 0 scan
                 return;
             }
             // Start/Stop icon
@@ -1037,10 +1235,11 @@ void analyzerLoop() {
         return;
     }
 
-    scanAllChannels();
-
-    // Bars draw every frame - smooth like scanner
-    drawSpectrum();
+    // CONSUMER: draw when Core 0 delivers new scan data
+    if (anaFrameReady && analyzerRunning) {
+        drawSpectrum();
+        anaFrameReady = false;  // Release Core 0 for next scan pass
+    }
 
     // Skulls draw every 100ms - saves performance
     if (millis() - lastSkullTime >= 100) {
@@ -1056,10 +1255,14 @@ bool isExitRequested() {
 }
 
 void cleanup() {
+    bool hadTask = (anaTaskHandle != NULL);
+    stopAnaTask();  // Task handles nrfPowerDown() + SPI.end()
+    if (!hadTask) {
+        nrfPowerDown();  // No task was running — power down directly
+    }
     analyzerRunning = false;
     exitRequested = false;
     waterfall_initialized = false;
-    nrfPowerDown();
 }
 
 }  // namespace Analyzer
