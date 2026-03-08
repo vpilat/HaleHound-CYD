@@ -33,7 +33,7 @@ namespace EapolCapture {
 // CONFIGURATION
 // ═══════════════════════════════════════════════════════════════════════════
 
-#define EC_MAX_APS          16      // Max APs to show in scan list
+#define EC_MAX_APS          32      // Max APs to show in scan list
 #define EC_MAX_FRAME_LEN    400     // Max EAPOL frame we'll store
 #define EC_DEAUTH_BURST     30      // Deauth frames per burst — 30 proven to force client reauth
 #define EC_DEAUTH_DELAY_MS  10      // Delay between deauth frames (ms)
@@ -63,6 +63,10 @@ struct APInfo {
 static APInfo apList[EC_MAX_APS];
 static int apCount = 0;
 static int selectedAP = -1;
+
+// Pagination
+static int ecCurrentPage = 0;
+static const int EC_APS_PER_PAGE = 12;
 
 // Capture state
 static volatile uint32_t packetCount = 0;
@@ -722,18 +726,23 @@ static void drawAPList() {
     tft.print("ENC");
     tft.drawLine(5, SCALE_Y(72), GRAPH_PADDED_W, SCALE_Y(72), HALEHOUND_VIOLET);
 
-    // List APs — fit max items on screen at 16px spacing
+    // Pagination calculations
+    int totalPages = (apCount + EC_APS_PER_PAGE - 1) / EC_APS_PER_PAGE;
+    if (ecCurrentPage >= totalPages) ecCurrentPage = totalPages - 1;
+    if (ecCurrentPage < 0) ecCurrentPage = 0;
+    int startIdx = ecCurrentPage * EC_APS_PER_PAGE;
+    int endIdx = startIdx + EC_APS_PER_PAGE;
+    if (endIdx > apCount) endIdx = apCount;
+
     int lineH = SCALE_Y(16);
     int listStartY = SCALE_Y(76);
-    int maxShow = apCount;
-    int maxFit = (SCREEN_HEIGHT - listStartY - SCALE_Y(30)) / lineH;
-    if (maxShow > maxFit) maxShow = maxFit;
 
     // Adaptive SSID truncation for screen width
     int ssidMaxChars = (SCREEN_WIDTH > 240) ? 24 : 19;
 
-    for (int i = 0; i < maxShow; i++) {
-        int y = listStartY + (i * lineH);
+    for (int i = startIdx; i < endIdx; i++) {
+        int row = i - startIdx;
+        int y = listStartY + (row * lineH);
 
         // Only show WPA2+ (skip open/WEP — no EAPOL)
         bool hasEAPOL = (apList[i].authMode >= WIFI_AUTH_WPA_PSK);
@@ -769,22 +778,65 @@ static void drawAPList() {
         }
     }
 
-    // Footer
-    tft.setTextColor(HALEHOUND_GUNMETAL);
-    tft.setCursor(10, listStartY + (maxShow * lineH) + 8);
-    tft.printf("Found %d APs -- tap WPA2+ to capture", apCount);
+    // Navigation bar — below the 12 list rows
+    int navY = listStartY + (EC_APS_PER_PAGE * lineH) + 4;
+
+    if (totalPages > 1) {
+        // "< Prev" button (left side)
+        if (ecCurrentPage > 0) {
+            tft.setTextColor(HALEHOUND_HOTPINK);
+            tft.setCursor(10, navY);
+            tft.print("< Prev");
+        }
+
+        // Page indicator (center)
+        tft.setTextColor(HALEHOUND_GUNMETAL);
+        char pgBuf[16];
+        snprintf(pgBuf, sizeof(pgBuf), "Pg %d/%d", ecCurrentPage + 1, totalPages);
+        int pgW = strlen(pgBuf) * 6;
+        tft.setCursor((SCREEN_WIDTH - pgW) / 2, navY);
+        tft.print(pgBuf);
+
+        // "Next >" button (right side)
+        if (ecCurrentPage < totalPages - 1) {
+            tft.setTextColor(HALEHOUND_HOTPINK);
+            tft.setCursor(SCREEN_WIDTH - 46, navY);
+            tft.print("Next >");
+        }
+    } else {
+        // Single page — just show count
+        tft.setTextColor(HALEHOUND_GUNMETAL);
+        tft.setCursor(10, navY);
+        tft.printf("Found %d APs -- tap WPA2+ to capture", apCount);
+    }
 }
 
+// Return: >=0 = AP index (absolute), -1 = no touch, -2 = prev page, -3 = next page
 static int checkAPListTouch() {
     uint16_t tx, ty;
     if (!getTouchPoint(&tx, &ty)) return -1;
+
     int listStartY = SCALE_Y(76);
     int lineH = SCALE_Y(16);
-    int maxFit = (SCREEN_HEIGHT - listStartY - SCALE_Y(30)) / lineH;
-    if (ty < listStartY || ty > (listStartY + maxFit * lineH)) return -1;
+    int navY = listStartY + (EC_APS_PER_PAGE * lineH) + 4;
+    int totalPages = (apCount + EC_APS_PER_PAGE - 1) / EC_APS_PER_PAGE;
 
-    int index = (ty - listStartY) / lineH;
-    if (index < 0 || index >= apCount || index >= maxFit) return -1;
+    // Check nav bar touch (Prev / Next buttons)
+    if (totalPages > 1 && ty >= (navY - 4) && ty <= (navY + 16)) {
+        delay(200);
+        if (tx < SCREEN_WIDTH / 3 && ecCurrentPage > 0) return -2;           // Prev
+        if (tx > (SCREEN_WIDTH * 2 / 3) && ecCurrentPage < totalPages - 1) return -3;  // Next
+        return -1;  // Tapped center (page indicator) — ignore
+    }
+
+    // Check AP row touch
+    if (ty < listStartY || ty >= navY) return -1;
+
+    int row = (ty - listStartY) / lineH;
+    if (row < 0 || row >= EC_APS_PER_PAGE) return -1;
+
+    int index = row + (ecCurrentPage * EC_APS_PER_PAGE);
+    if (index >= apCount) return -1;
 
     // Only allow selecting WPA2+ (has EAPOL)
     if (apList[index].authMode < WIFI_AUTH_WPA_PSK) return -1;
@@ -1073,6 +1125,7 @@ void setup() {
     currentPhase = PHASE_SCAN;
     exitRequested = false;
     selectedAP = -1;
+    ecCurrentPage = 0;
     apCount = 0;
     packetCount = 0;
     eapolCount = 0;
@@ -1120,6 +1173,7 @@ void loop() {
             notifiedCapture = false;
             wifiFullDeinit();
             currentPhase = PHASE_SCAN;
+            ecCurrentPage = 0;
             packetCount = 0;
             eapolCount = 0;
             hasMsg1 = hasMsg2 = hasMsg3 = hasMsg4 = false;
@@ -1150,8 +1204,22 @@ void loop() {
     }
 
     if (currentPhase == PHASE_SCAN) {
-        // Check for AP selection touch
+        // Check for AP selection or page navigation touch
         int tapped = checkAPListTouch();
+        if (tapped == -2) {
+            // Prev page
+            ecCurrentPage--;
+            drawAPList();
+            waitForTouchRelease();
+            return;
+        }
+        if (tapped == -3) {
+            // Next page
+            ecCurrentPage++;
+            drawAPList();
+            waitForTouchRelease();
+            return;
+        }
         if (tapped >= 0) {
             Serial.printf("[EAPOL] AP selected: %d '%s' auth=%d ch=%d\n",
                           tapped, apList[tapped].ssid, apList[tapped].authMode, apList[tapped].channel);
@@ -1316,6 +1384,7 @@ void cleanup() {
     wifiFullDeinit();
     exitRequested = false;
     currentPhase = PHASE_SCAN;
+    ecCurrentPage = 0;
     deauthRunning = false;
     deauthAnimFrame = 0;
     lastDeauthSend = 0;
