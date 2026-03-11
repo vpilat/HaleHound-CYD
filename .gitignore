@@ -13,6 +13,9 @@
 FIRMWARE_PORT_PLAN.md
 PROGRESS_*.md
 
+# Find You private keys (NEVER commit — contains location retrieval keys)
+findyou_keys.json
+
 # OS files
 .DS_Store
 Thumbs.db

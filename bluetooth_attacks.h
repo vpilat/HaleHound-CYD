@@ -221,6 +221,74 @@ void cleanup();
 }  // namespace LunaticFringe
 
 // ═══════════════════════════════════════════════════════════════════════════
+// PHANTOM FLOOD - Apple FindMy Offline Finding BLE Flood
+// Broadcasts fake FindMy OF advertisements with random 28-byte public keys
+// Each key appears as a unique tracker — floods locationd on nearby iPhones
+// ═══════════════════════════════════════════════════════════════════════════
+
+namespace PhantomFlood {
+
+// Initialize BLE and draw UI
+void setup();
+
+// Main loop - touch handling, display update
+void loop();
+
+// Check if user requested exit
+bool isExitRequested();
+
+// Cleanup BLE resources
+void cleanup();
+
+}  // namespace PhantomFlood
+
+// ═══════════════════════════════════════════════════════════════════════════
+// AIRTAG REPLAY - FindMy Advertisement Sniff & Replay
+// Captures real AirTag/FindMy BLE advertisements (MAC + full 31-byte payload)
+// then replays them — ESP32 impersonates the real AirTag identity
+// ═══════════════════════════════════════════════════════════════════════════
+
+namespace AirTagReplay {
+
+// Initialize scanner and draw UI
+void setup();
+
+// Main loop - scan/replay phases, touch handling, display
+void loop();
+
+// Check if user requested exit
+bool isExitRequested();
+
+// Cleanup BLE resources and stop replay task
+void cleanup();
+
+}  // namespace AirTagReplay
+
+// ═══════════════════════════════════════════════════════════════════════════
+// FIND YOU - Stealth AirTag Clone (P-224 EC Key Rotation)
+// Broadcasts real FindMy OF advertisements using pre-generated P-224 keypairs
+// Each key rotates every 15-120s — below Apple's anti-stalking detection window
+// Owner retrieves GPS locations with matching private keys via macless-haystack
+// Based on Positive Security "Find You" research (PoPETs 2021 / ACM WiSec 2021)
+// ═══════════════════════════════════════════════════════════════════════════
+
+namespace FindYou {
+
+// Initialize BLE and draw UI
+void setup();
+
+// Main loop - touch handling, key rotation, display update
+void loop();
+
+// Check if user requested exit
+bool isExitRequested();
+
+// Cleanup BLE resources and free state
+void cleanup();
+
+}  // namespace FindYou
+
+// ═══════════════════════════════════════════════════════════════════════════
 // BLE JAMMER - 2.4GHz BLE Jammer using NRF24L01+PA+LNA
 // Continuous carrier wave jamming on Bluetooth 2.402-2.480 GHz
 // Modes: ALL CHANNELS | ADV ONLY (Ch37/38/39) | DATA ONLY

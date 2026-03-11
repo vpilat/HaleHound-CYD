@@ -142,7 +142,7 @@ const char *bluetooth_submenu_items[bluetooth_NUM_SUBMENU_ITEMS] = {
     "Sniffer",
     "BLE Scanner",
     "WhisperPair",
-    "AirTag Detect",
+    "AirTag",
     "Lunatic Fringe",
     "Back to Main Menu"
 };
@@ -156,6 +156,24 @@ const unsigned char *bluetooth_submenu_icons[bluetooth_NUM_SUBMENU_ITEMS] = {
     bitmap_icon_eye,
     bitmap_icon_apple,
     bitmap_icon_scanner,
+    bitmap_icon_go_back
+};
+
+// AirTag Hub Submenu - 5 items (const * const → .rodata/flash, saves DRAM)
+const int airtag_NUM_SUBMENU_ITEMS = 5;
+static const char * const airtag_submenu_items_flash[] = {
+    "AirTag Detect",
+    "Phantom Flood",
+    "AirTag Replay",
+    "Find You",
+    "Back"
+};
+
+static const unsigned char * const airtag_submenu_icons_flash[] = {
+    bitmap_icon_scanner,
+    bitmap_icon_nuke,
+    bitmap_icon_antenna,
+    bitmap_icon_eye,
     bitmap_icon_go_back
 };
 
@@ -993,16 +1011,8 @@ void handleBluetoothSubmenuTouch() {
                     }
                     WhisperPair::cleanup();
                     break;
-                case 6: // AirTag Detect
-                    AirTagDetect::setup();
-                    while (!feature_exit_requested) {
-                        AirTagDetect::loop();
-                        if (AirTagDetect::isExitRequested()) feature_exit_requested = true;
-                        touchButtonsUpdate();
-                        if (isBackButtonTapped()) feature_exit_requested = true;
-                        if (IS_BOOT_PRESSED()) feature_exit_requested = true;
-                    }
-                    AirTagDetect::cleanup();
+                case 6: // AirTag Hub — sub-submenu
+                    handleAirTagHubTouch();
                     break;
                 case 7: // Lunatic Fringe (Multi-platform tracker detect)
                     LunaticFringe::setup();
@@ -1019,6 +1029,133 @@ void handleBluetoothSubmenuTouch() {
             break;
         }
     }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// AIRTAG HUB SUBMENU HANDLER
+// ═══════════════════════════════════════════════════════════════════════════
+
+void handleAirTagHubTouch() {
+    // Swap active submenu pointers to AirTag hub arrays (cast: flash arrays are const * const)
+    active_submenu_items = (const char **)airtag_submenu_items_flash;
+    active_submenu_size = airtag_NUM_SUBMENU_ITEMS;
+    active_submenu_icons = (const unsigned char **)airtag_submenu_icons_flash;
+    current_submenu_index = 0;
+    submenu_initialized = false;
+    displaySubmenu();
+    delay(200);
+
+    bool in_airtag_hub = true;
+    while (in_airtag_hub) {
+        touchButtonsUpdate();
+
+        // Icon bar back button — exit to Bluetooth menu
+        if (isBackButtonTapped()) {
+            break;
+        }
+
+        for (int i = 0; i < airtag_NUM_SUBMENU_ITEMS; i++) {
+            int yPos = SUBMENU_Y_START + i * SUBMENU_Y_SPACING;
+            if (i == airtag_NUM_SUBMENU_ITEMS - 1) yPos += SUBMENU_LAST_GAP;
+
+            if (isTouchInArea(10, yPos, SUBMENU_TOUCH_W, SUBMENU_TOUCH_H)) {
+                current_submenu_index = i;
+                last_interaction_time = millis();
+                displaySubmenu();
+                delay(200);
+
+                if (current_submenu_index == 4) { // Back
+                    in_airtag_hub = false;
+                    break;
+                }
+
+                feature_active = true;
+                feature_exit_requested = false;
+                waitForTouchRelease();
+
+                switch (current_submenu_index) {
+                    case 0: // AirTag Detect
+                        AirTagDetect::setup();
+                        while (!feature_exit_requested) {
+                            AirTagDetect::loop();
+                            if (AirTagDetect::isExitRequested()) feature_exit_requested = true;
+                            touchButtonsUpdate();
+                            if (isBackButtonTapped()) feature_exit_requested = true;
+                            if (IS_BOOT_PRESSED()) feature_exit_requested = true;
+                        }
+                        AirTagDetect::cleanup();
+                        break;
+                    case 1: // Phantom Flood (FindMy BLE Flood)
+                        if (!isOffensiveAllowed()) {
+                            if (blue_team_mode) { showBlueTeamBlockedScreen(); if (!showDisclaimerScreen()) break; }
+                            else if (!showDisclaimerScreen()) break;
+                            if (!isOffensiveAllowed()) break;
+                        }
+                        PhantomFlood::setup();
+                        while (!feature_exit_requested) {
+                            PhantomFlood::loop();
+                            if (PhantomFlood::isExitRequested()) feature_exit_requested = true;
+                            touchButtonsUpdate();
+                            if (isBackButtonTapped()) feature_exit_requested = true;
+                            if (IS_BOOT_PRESSED()) feature_exit_requested = true;
+                        }
+                        PhantomFlood::cleanup();
+                        break;
+                    case 2: // AirTag Replay (Sniff + Replay)
+                        if (!isOffensiveAllowed()) {
+                            if (blue_team_mode) { showBlueTeamBlockedScreen(); if (!showDisclaimerScreen()) break; }
+                            else if (!showDisclaimerScreen()) break;
+                            if (!isOffensiveAllowed()) break;
+                        }
+                        AirTagReplay::setup();
+                        while (!feature_exit_requested) {
+                            AirTagReplay::loop();
+                            if (AirTagReplay::isExitRequested()) feature_exit_requested = true;
+                            touchButtonsUpdate();
+                            if (isBackButtonTapped()) feature_exit_requested = true;
+                            if (IS_BOOT_PRESSED()) feature_exit_requested = true;
+                        }
+                        AirTagReplay::cleanup();
+                        break;
+                    case 3: // Find You (Stealth AirTag Clone)
+                        if (!isOffensiveAllowed()) {
+                            if (blue_team_mode) { showBlueTeamBlockedScreen(); if (!showDisclaimerScreen()) break; }
+                            else if (!showDisclaimerScreen()) break;
+                            if (!isOffensiveAllowed()) break;
+                        }
+                        FindYou::setup();
+                        while (!feature_exit_requested) {
+                            FindYou::loop();
+                            if (FindYou::isExitRequested()) feature_exit_requested = true;
+                            touchButtonsUpdate();
+                            if (isBackButtonTapped()) feature_exit_requested = true;
+                            if (IS_BOOT_PRESSED()) feature_exit_requested = true;
+                        }
+                        FindYou::cleanup();
+                        break;
+                }
+
+                // After module exits, return to AirTag hub (NOT Bluetooth menu)
+                feature_active = false;
+                feature_exit_requested = false;
+                active_submenu_items = (const char **)airtag_submenu_items_flash;
+                active_submenu_size = airtag_NUM_SUBMENU_ITEMS;
+                active_submenu_icons = (const unsigned char **)airtag_submenu_icons_flash;
+                current_submenu_index = 0;
+                submenu_initialized = false;
+                displaySubmenu();
+                delay(200);
+                break;  // break out of for loop, continue while loop
+            }
+        }
+    }
+
+    // Restore Bluetooth submenu pointers for caller's returnToSubmenu()
+    active_submenu_items = bluetooth_submenu_items;
+    active_submenu_size = bluetooth_NUM_SUBMENU_ITEMS;
+    active_submenu_icons = bluetooth_submenu_icons;
+    current_submenu_index = 0;
+    submenu_initialized = false;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════

