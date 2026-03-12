@@ -113,4 +113,49 @@ void cleanup();
 
 }  // namespace ProtoKill
 
+// ═══════════════════════════════════════════════════════════════════════════
+// NRF24 PROMISCUOUS SNIFFER
+// Travis Goodspeed technique — captures raw 2.4GHz packets from ANY device
+// Extracts device addresses for MouseJack injection
+// ═══════════════════════════════════════════════════════════════════════════
+
+namespace NrfSniffer {
+
+// Initialize sniffer and draw UI
+void setup();
+
+// Main loop function
+void loop();
+
+// Check if user requested exit
+bool isExitRequested();
+
+// Cleanup
+void cleanup();
+
+}  // namespace NrfSniffer
+
+// ═══════════════════════════════════════════════════════════════════════════
+// MOUSEJACK - Wireless Keyboard Keystroke Injection
+// Injects keystrokes into vulnerable Logitech Unifying, Dell, Microsoft
+// 2.4GHz wireless keyboards via NRF24L01+
+// Ref: Bastille Research (mousejack.com), Marc Newlin nrf-research-firmware
+// ═══════════════════════════════════════════════════════════════════════════
+
+namespace MouseJack {
+
+// Initialize MouseJack and draw UI
+void setup();
+
+// Main loop function
+void loop();
+
+// Check if user requested exit
+bool isExitRequested();
+
+// Cleanup
+void cleanup();
+
+}  // namespace MouseJack
+
 #endif // NRF24_ATTACKS_H

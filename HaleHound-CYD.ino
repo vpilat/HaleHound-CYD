@@ -133,8 +133,8 @@ const unsigned char *wifi_submenu_icons[NUM_SUBMENU_ITEMS] = {
     bitmap_icon_go_back
 };
 
-// Bluetooth Submenu - 9 items
-const int bluetooth_NUM_SUBMENU_ITEMS = 9;
+// Bluetooth Submenu - 10 items
+const int bluetooth_NUM_SUBMENU_ITEMS = 10;
 const char *bluetooth_submenu_items[bluetooth_NUM_SUBMENU_ITEMS] = {
     "BLE Jammer",
     "BLE Spoofer",
@@ -144,6 +144,7 @@ const char *bluetooth_submenu_items[bluetooth_NUM_SUBMENU_ITEMS] = {
     "WhisperPair",
     "AirTag",
     "Lunatic Fringe",
+    "BLE Ducky",
     "Back to Main Menu"
 };
 
@@ -156,6 +157,7 @@ const unsigned char *bluetooth_submenu_icons[bluetooth_NUM_SUBMENU_ITEMS] = {
     bitmap_icon_eye,
     bitmap_icon_apple,
     bitmap_icon_scanner,
+    bitmap_icon_key,            // BLE Ducky - key icon
     bitmap_icon_go_back
 };
 
@@ -177,11 +179,13 @@ static const unsigned char * const airtag_submenu_icons_flash[] = {
     bitmap_icon_go_back
 };
 
-// NRF24 2.4GHz Submenu - 5 items
-const int nrf_NUM_SUBMENU_ITEMS = 5;
+// NRF24 2.4GHz Submenu - 7 items
+const int nrf_NUM_SUBMENU_ITEMS = 7;
 const char *nrf_submenu_items[nrf_NUM_SUBMENU_ITEMS] = {
     "Scanner",
     "Spectrum Analyzer",
+    "NRF Sniffer",
+    "MouseJack",
     "WLAN Jammer",
     "Proto Kill",
     "Back to Main Menu"
@@ -190,8 +194,10 @@ const char *nrf_submenu_items[nrf_NUM_SUBMENU_ITEMS] = {
 const unsigned char *nrf_submenu_icons[nrf_NUM_SUBMENU_ITEMS] = {
     bitmap_icon_scanner,
     bitmap_icon_analyzer,
+    bitmap_icon_eye,            // NRF Sniffer - eye icon
+    bitmap_icon_nuke,           // MouseJack - nuke icon
     bitmap_icon_wifi_jammer,
-    bitmap_icon_skull_jammer,  // Proto Kill - skull jammer icon
+    bitmap_icon_skull_jammer,   // Proto Kill - skull jammer icon
     bitmap_icon_go_back
 };
 
@@ -920,7 +926,7 @@ void handleBluetoothSubmenuTouch() {
             displaySubmenu();
             delay(200);
 
-            if (current_submenu_index == 8) { // Back
+            if (current_submenu_index == 9) { // Back
                 returnToMainMenu();
                 return;
             }
@@ -1022,6 +1028,22 @@ void handleBluetoothSubmenuTouch() {
                         if (IS_BOOT_PRESSED()) feature_exit_requested = true;
                     }
                     LunaticFringe::cleanup();
+                    break;
+                case 8: // BLE Ducky
+                    if (!isOffensiveAllowed()) {
+                        if (blue_team_mode) { showBlueTeamBlockedScreen(); if (!showDisclaimerScreen()) break; }
+                        else if (!showDisclaimerScreen()) break;
+                        if (!isOffensiveAllowed()) break;
+                    }
+                    BleDucky::setup();
+                    while (!feature_exit_requested) {
+                        BleDucky::loop();
+                        if (BleDucky::isExitRequested()) feature_exit_requested = true;
+                        touchButtonsUpdate();
+                        if (isBackButtonTapped()) feature_exit_requested = true;
+                        if (IS_BOOT_PRESSED()) feature_exit_requested = true;
+                    }
+                    BleDucky::cleanup();
                     break;
             }
 
@@ -1180,7 +1202,7 @@ void handleNRFSubmenuTouch() {
             displaySubmenu();
             delay(200);
 
-            if (current_submenu_index == 4) { // Back
+            if (current_submenu_index == 6) { // Back
                 returnToMainMenu();
                 return;
             }
@@ -1208,7 +1230,32 @@ void handleNRFSubmenuTouch() {
                     }
                     Analyzer::cleanup();
                     break;
-                case 2: // WLAN Jammer
+                case 2: // NRF Sniffer
+                    NrfSniffer::setup();
+                    while (!feature_exit_requested) {
+                        NrfSniffer::loop();
+                        if (NrfSniffer::isExitRequested()) feature_exit_requested = true;
+                        touchButtonsUpdate();
+                        if (isBackButtonTapped()) feature_exit_requested = true;
+                    }
+                    NrfSniffer::cleanup();
+                    break;
+                case 3: // MouseJack
+                    if (!isOffensiveAllowed()) {
+                        if (blue_team_mode) { showBlueTeamBlockedScreen(); if (!showDisclaimerScreen()) break; }
+                        else if (!showDisclaimerScreen()) break;
+                        if (!isOffensiveAllowed()) break;
+                    }
+                    MouseJack::setup();
+                    while (!feature_exit_requested) {
+                        MouseJack::loop();
+                        if (MouseJack::isExitRequested()) feature_exit_requested = true;
+                        touchButtonsUpdate();
+                        if (isBackButtonTapped()) feature_exit_requested = true;
+                    }
+                    MouseJack::cleanup();
+                    break;
+                case 4: // WLAN Jammer
                     if (!isOffensiveAllowed()) {
                         if (blue_team_mode) { showBlueTeamBlockedScreen(); if (!showDisclaimerScreen()) break; }
                         else if (!showDisclaimerScreen()) break;
@@ -1222,7 +1269,7 @@ void handleNRFSubmenuTouch() {
                     }
                     WLANJammer::cleanup();
                     break;
-                case 3: // Proto Kill
+                case 5: // Proto Kill
                     if (!isOffensiveAllowed()) {
                         if (blue_team_mode) { showBlueTeamBlockedScreen(); if (!showDisclaimerScreen()) break; }
                         else if (!showDisclaimerScreen()) break;
@@ -4126,11 +4173,20 @@ void setup() {
         SPI.begin(VSPI_SCK, VSPI_MISO, VSPI_MOSI);
         delay(150);  // PA+LNA settling time
 
-        // Raw SPI probe — read SETUP_AW register (0x03)
+        // Reset SETUP_AW to default first — promiscuous sniffer leaves it at 0x00
+        // NRF24 retains registers across ESP32 reset (no power cycle on USB)
         SPI.beginTransaction(SPISettings(4000000, MSBFIRST, SPI_MODE0));
         digitalWrite(NRF24_CSN, LOW);
         delayMicroseconds(5);
-        uint8_t nrfStatus = SPI.transfer(0x03);
+        SPI.transfer(0x20 | 0x03);  // Write register 0x03 (SETUP_AW)
+        SPI.transfer(0x03);         // 5-byte address width (default)
+        digitalWrite(NRF24_CSN, HIGH);
+        delayMicroseconds(5);
+
+        // Now read it back to verify NRF24 is responding
+        digitalWrite(NRF24_CSN, LOW);
+        delayMicroseconds(5);
+        uint8_t nrfStatus = SPI.transfer(0x03);  // Read register 0x03
         uint8_t nrfSetupAw = SPI.transfer(0xFF);
         digitalWrite(NRF24_CSN, HIGH);
         SPI.endTransaction();

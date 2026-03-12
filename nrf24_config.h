@@ -145,6 +145,22 @@ bool nrf24IsPALNA();
 void nrf24PrintStatus();
 
 // ═══════════════════════════════════════════════════════════════════════════
+// PROMISCUOUS MODE (Travis Goodspeed technique)
+// ═══════════════════════════════════════════════════════════════════════════
+
+// Configure NRF24 for promiscuous RX (raw SPI, bypasses RF24 library)
+// Uses SETUP_AW=0x00 trick for 2-byte illegal address width
+// Returns true if radio was configured successfully
+bool nrf24SetPromiscuous();
+
+// Restore normal RF24 library control after promiscuous mode
+void nrf24ExitPromiscuous();
+
+// Read raw packet from RX FIFO in promiscuous mode
+// Returns number of bytes read (0 if FIFO empty), up to maxLen
+int nrf24ReadRawPacket(uint8_t* buf, uint8_t maxLen);
+
+// ═══════════════════════════════════════════════════════════════════════════
 // SPI BUS MANAGEMENT (Shared with CC1101)
 // ═══════════════════════════════════════════════════════════════════════════
 
