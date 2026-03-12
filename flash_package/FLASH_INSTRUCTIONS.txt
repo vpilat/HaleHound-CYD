@@ -1,6 +1,6 @@
 ================================================================================
               HALEHOUND-CYD FLASH INSTRUCTIONS
-              v3.2.0 CYD Edition
+              v3.3.0 CYD Edition
 ================================================================================
 
   Repository:   https://github.com/JesseCHale/HaleHound-CYD
@@ -38,26 +38,53 @@ to compensate. This is NOT a landscape mode.
 
 
 ================================================================================
+  CHOOSE YOUR BOARD
+================================================================================
+
+Four boards are supported. Use the correct firmware file for your board.
+
+  CYD 2.8" (ESP32-2432S028):
+    Single file:  HaleHound-CYD-FULL.bin
+    Four file:    HaleHound-CYD.bin
+
+  CYD 3.5" (ESP32-3248S035C):
+    Single file:  HaleHound-CYD-35-FULL.bin
+    Four file:    HaleHound-CYD-35.bin
+
+  NM-RF-Hat:
+    Single file:  HaleHound-CYD-HAT-FULL.bin
+    Four file:    HaleHound-CYD-HAT.bin
+
+  QDtech E32R28T:
+    Single file:  HaleHound-E32R28T-FULL.bin
+    Four file:    HaleHound-E32R28T.bin
+
+The bootloader, partitions, and boot_app0 files are shared across all
+boards. Only the firmware binary differs per board.
+
+
+================================================================================
   CHOOSE YOUR FLASH METHOD
 ================================================================================
 
 There are TWO flash methods. If one doesn't work, try the other.
+Replace "HaleHound-CYD" below with your board's filename from above.
 
 ----------------------------------------------------------------------
   METHOD A: SINGLE FILE (Easiest -- works for most boards)
 ----------------------------------------------------------------------
 
-  FILE:  HaleHound-CYD-FULL.bin
+  FILE:  HaleHound-CYD-FULL.bin  (or your board's -FULL.bin)
   FLASH ADDRESS: 0x0
 
   USING ESP WEB FLASHER (Browser -- no install needed):
     1. Open https://esp.huhn.me in Chrome, Edge, or Opera
        (Firefox and Safari do NOT support Web Serial)
-    2. Click "Connect" and select your CYD's serial port
+    2. Click "Connect" and select your board's serial port
     3. Set address to: 0x0
-    4. Click "Choose File" and select HaleHound-CYD-FULL.bin
+    4. Click "Choose File" and select your board's -FULL.bin
     5. Click "Program"
-    6. Wait for completion, then power cycle the CYD
+    6. Wait for completion, then power cycle the board
 
   USING ESPTOOL (Command line):
     esptool.py --chip esp32 --baud 115200 write_flash 0x0 HaleHound-CYD-FULL.bin
@@ -77,18 +104,18 @@ There are TWO flash methods. If one doesn't work, try the other.
     bootloader.bin ......... 0x1000
     partitions.bin ......... 0x8000
     boot_app0.bin .......... 0xe000
-    HaleHound-CYD.bin ...... 0x10000
+    HaleHound-CYD.bin ...... 0x10000  (or your board's .bin)
 
   USING ESP WEB FLASHER (Browser):
     1. Open https://esp.huhn.me in Chrome, Edge, or Opera
-    2. Click "Connect" and select your CYD's serial port
+    2. Click "Connect" and select your board's serial port
     3. Add ALL FOUR files with their addresses:
          0x1000  -> bootloader.bin
          0x8000  -> partitions.bin
          0xe000  -> boot_app0.bin
-         0x10000 -> HaleHound-CYD.bin
+         0x10000 -> HaleHound-CYD.bin  (or your board's .bin)
     4. Click "Program"
-    5. Wait for completion, then power cycle the CYD
+    5. Wait for completion, then power cycle the board
 
   USING ESPTOOL (Command line):
     esptool.py --chip esp32 --baud 115200 write_flash \
@@ -166,14 +193,26 @@ There are TWO flash methods. If one doesn't work, try the other.
   FILE LIST
 ================================================================================
 
-  SINGLE FILE METHOD (flash to 0x0):
-    HaleHound-CYD-FULL.bin ......... Complete image (bootloader + firmware)
-
-  FOUR FILE METHOD (flash to individual addresses):
+  SHARED BOOT FILES (same for all boards):
     bootloader.bin .................. 0x1000
     partitions.bin .................. 0x8000
     boot_app0.bin ................... 0xe000
-    HaleHound-CYD.bin .............. 0x10000 (firmware only)
+
+  CYD 2.8" (ESP32-2432S028):
+    HaleHound-CYD-FULL.bin ......... 0x0 (single file, complete image)
+    HaleHound-CYD.bin .............. 0x10000 (firmware only, 4-file method)
+
+  CYD 3.5" (ESP32-3248S035C):
+    HaleHound-CYD-35-FULL.bin ...... 0x0 (single file, complete image)
+    HaleHound-CYD-35.bin ........... 0x10000 (firmware only, 4-file method)
+
+  NM-RF-Hat:
+    HaleHound-CYD-HAT-FULL.bin ..... 0x0 (single file, complete image)
+    HaleHound-CYD-HAT.bin .......... 0x10000 (firmware only, 4-file method)
+
+  QDtech E32R28T:
+    HaleHound-E32R28T-FULL.bin ..... 0x0 (single file, complete image)
+    HaleHound-E32R28T.bin .......... 0x10000 (firmware only, 4-file method)
 
 
 ================================================================================

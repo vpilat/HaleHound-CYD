@@ -44,7 +44,7 @@
 
 **ESP32-DIV HaleHound Edition for Cheap Yellow Display**
 
-Version **v3.2.0 CYD Edition** | By [JesseCHale](https://github.com/JesseCHale)
+Version **v3.3.0 CYD Edition** | By [JesseCHale](https://github.com/JesseCHale)
 
 ---
 
@@ -52,7 +52,7 @@ Version **v3.2.0 CYD Edition** | By [JesseCHale](https://github.com/JesseCHale)
 
 HaleHound-CYD is a multi-protocol offensive security toolkit built for the ESP32 "Cheap Yellow Display" (CYD) platform. Supports both the 2.8" (ESP32-2432S028) and 3.5" (ESP32-3248S035C) CYD boards. External CC1101 SubGHz, NRF24L01+PA+LNA 2.4GHz, PN532 NFC/RFID, and GPS modules connect via the CYD's breakout pins.
 
-Every attack module from the original ESP32-DIV is present, plus CYD-exclusive features: full touchscreen navigation, EAPOL/PMKID capture, Karma attacks, wardriving with GPS logging, PN532 RFID card scanning/cloning/brute force, defensive jam detection, UART serial monitor for hardware hacking, and OTA firmware updates from SD card.
+Every attack module from the original ESP32-DIV is present, plus CYD-exclusive features: full touchscreen navigation, EAPOL/PMKID capture, Karma attacks, wardriving with GPS logging, PN532 RFID card scanning/cloning/brute force, defensive jam detection, NRF24 promiscuous sniffer with MouseJack keystroke injection, AirTag attack suite (Phantom Flood, AirTag Replay, Find You), BLE HID keyboard injection (BLE Ducky), UART serial monitor for hardware hacking, and OTA firmware updates from SD card.
 
 All radios transmit at maximum power. No safety nets.
 
@@ -294,7 +294,7 @@ The MicroSD slot is **built into the CYD board** on the back. No external wiring
 ## Menu Tree
 
 ```
-HALEHOUND-CYD v3.2.0
+HALEHOUND-CYD v3.3.0
 │
 ├── WiFi ──────────────────────────────────────────────────
 │   ├── Packet Monitor ......... Real-time 802.11 frame capture
@@ -308,19 +308,26 @@ HALEHOUND-CYD v3.2.0
 │   └── Back to Main Menu
 │
 ├── Bluetooth ─────────────────────────────────────────────
-│   ├── BLE Jammer ............. Flood advertisements
-│   ├── BLE Spoofer ............ Clone device identities
-│   ├── BLE Beacon ............. Broadcast custom BLE beacons
-│   ├── Sniffer ................ Passive BLE traffic analysis
+│   ├── BLE Jammer ............. 2.4GHz BLE channel flood (NRF24)
+│   ├── BLE Spoofer ............ Multi-platform BLE spam engine
+│   ├── BLE Beacon ............. iBeacon / Eddystone transmitter
+│   ├── Sniffer ................ Passive BLE advertisement monitor
 │   ├── BLE Scanner ............ Discover nearby BLE devices
-│   ├── WhisperPair ............ CVE-2025-36911 Fast Pair scanner
-│   ├── AirTag Detect .......... Apple FindMy tracker detection
+│   ├── WhisperPair ............ CVE-2025-36911 Fast Pair exploit
+│   ├── AirTag Hub ─────────── Apple FindMy attack suite
+│   │   ├── AirTag Detect ...... FindMy tracker detection
+│   │   ├── Phantom Flood ...... FindMy OF advertisement flood
+│   │   ├── AirTag Replay ...... Sniff & replay AirTag identity
+│   │   └── Find You ........... Stealth AirTag clone (P-224 keys)
 │   ├── Lunatic Fringe ......... Multi-platform tracker scanner
+│   ├── BLE Ducky .............. BLE HID keyboard injection
 │   └── Back to Main Menu
 │
 ├── 2.4GHz (NRF24) ───────────────────────────────────────
 │   ├── Scanner ................ Channel activity scanner
 │   ├── Spectrum Analyzer ...... Visual RF spectrum display
+│   ├── NRF Sniffer ............ Promiscuous 2.4GHz packet capture
+│   ├── MouseJack .............. Wireless keyboard injection
 │   ├── WLAN Jammer ............ 2.4GHz broadband disruption
 │   ├── Proto Kill ............. Multi-protocol attack suite
 │   └── Back to Main Menu
@@ -513,7 +520,7 @@ Overwhelms a target AP's client table by flooding it with 802.11 authentication 
 
 ### Bluetooth Attacks
 
-All BLE attacks use the ESP32's built-in Bluetooth radio. Proper radio teardown between WiFi and BLE modes is handled automatically.
+All BLE attacks use the ESP32's built-in Bluetooth radio. Includes AirTag attack modules (Phantom Flood, AirTag Replay, Find You) and BLE HID keyboard injection (BLE Ducky). Proper radio teardown between WiFi and BLE modes is handled automatically.
 
 #### BLE Jammer
 
@@ -603,6 +610,78 @@ Scans for commercial BLE tracking devices across all major platforms. Identifies
 
 *Concept: Duggie*
 
+#### Phantom Flood — FindMy Advertisement Flood
+
+Broadcasts fake FindMy OF (Owner-Finding) advertisements with random 28-byte public keys. Each advertisement appears as a unique tracker to Apple's locationd service on nearby iPhones, flooding the FindMy device list.
+
+```
+┌──────────────────────────────────────────────┐
+│  ATTACK FLOW                                 │
+│                                              │
+│  1. Init BLE advertising (ESP-IDF raw API)   │
+│  2. Generate random 28-byte public key       │
+│  3. Build FindMy OF advertisement payload    │
+│  4. Broadcast via BLE advertising            │
+│  5. Rotate key every cycle                   │
+│  6. Each key = unique "tracker" on targets   │
+│  7. Display flood count on screen            │
+└──────────────────────────────────────────────┘
+```
+
+#### AirTag Replay — Sniff & Replay AirTag Identity
+
+Captures real AirTag and FindMy BLE advertisements (MAC address + full 31-byte payload), then replays them. The ESP32 impersonates the real AirTag's identity, appearing as that tracker to nearby Apple devices.
+
+```
+┌──────────────────────────────────────────────┐
+│  ATTACK FLOW                                 │
+│                                              │
+│  1. BLE scan for FindMy advertisements       │
+│  2. Filter: company ID 0x004C (Apple)        │
+│  3. Capture MAC + full advertisement payload │
+│  4. User selects captured AirTag identity    │
+│  5. Set ESP32 BLE address to captured MAC    │
+│  6. Replay captured advertisement payload    │
+│  7. ESP32 appears as the real AirTag         │
+└──────────────────────────────────────────────┘
+```
+
+#### Find You — Stealth AirTag Clone
+
+Stealth AirTag clone using pre-generated P-224 elliptic curve keypairs. Keys rotate every 15-120 seconds, staying below Apple's anti-stalking detection window. The owner retrieves GPS locations via macless-haystack against Apple's FindMy network.
+
+```
+┌──────────────────────────────────────────────┐
+│  ATTACK FLOW                                 │
+│                                              │
+│  1. Load pre-generated P-224 EC keypairs     │
+│  2. Build FindMy advertisement with key      │
+│  3. Broadcast via BLE advertising            │
+│  4. Rotate to next key every 15-120s         │
+│  5. Below Apple anti-stalking threshold      │
+│  6. Nearby iPhones relay location to Apple   │
+│  7. Owner retrieves via macless-haystack     │
+└──────────────────────────────────────────────┘
+```
+
+#### BLE Ducky — BLE HID Keyboard Injection
+
+ESP32 acts as a BLE HID keyboard using the ESP32-BLE-Keyboard library. Target device pairs with "HaleHound KB", then the ESP32 injects keystroke payloads. Pre-built payloads include reverse shell (PowerShell/bash), Rick Roll, and custom string entry.
+
+```
+┌──────────────────────────────────────────────┐
+│  ATTACK FLOW                                 │
+│                                              │
+│  1. Init BLE HID keyboard (ESP32-BLE-KB)     │
+│  2. Advertise as "HaleHound KB"              │
+│  3. Wait for target to pair                  │
+│  4. User selects payload from menu           │
+│  5. Inject keystrokes at 50ms timing         │
+│  6. Progress bar shows injection status      │
+│  7. Requires target to accept BLE pairing    │
+└──────────────────────────────────────────────┘
+```
+
 ---
 
 ### 2.4GHz NRF24 Attacks
@@ -636,6 +715,48 @@ Broadband 2.4GHz disruption. The NRF24+PA+LNA rapidly cycles through channels tr
 │           wireless keyboards/mice,       │
 │           baby monitors, drones          │
 └──────────────────────────────────────────┘
+```
+
+#### NRF Sniffer — Promiscuous 2.4GHz Packet Capture
+
+Travis Goodspeed promiscuous receive mode on the NRF24L01+PA+LNA. Captures raw 2.4GHz packets from any device — wireless keyboards, mice, drones, IoT sensors. Extracts device addresses for MouseJack injection. Core 0 channel-hopping task sweeps all 126 channels. Packet list UI with tap-to-select address, hex dump detail view.
+
+```
+┌──────────────────────────────────────────────┐
+│  CAPTURE METHOD                              │
+│                                              │
+│  1. Set NRF24 to promiscuous mode            │
+│     (SETUP_AW=0, 2-byte addr 0x00AA)        │
+│  2. Disable CRC, max payload length          │
+│  3. Core 0 task: hop channels 0-125          │
+│  4. Capture raw packets on each channel      │
+│  5. Extract source address from payload      │
+│  6. Display in scrollable packet list        │
+│  7. Tap packet → detail view with hex dump   │
+│  8. Tap address → auto-populate MouseJack    │
+└──────────────────────────────────────────────┘
+```
+
+#### MouseJack — Wireless Keyboard Injection
+
+Keystroke injection into Logitech Unifying, Dell, and Microsoft wireless keyboards via NRF24. Fixed Logitech HID++ packet format with 0xC1 frame type, LRC checksum, and 16-bit CRC. Full HID scancode keymap: a-z, 0-9, symbols, F1-F12, arrows, modifiers. Pre-built payloads: reverse shell (PowerShell/bash), WiFi exfil, custom string. Core 0 injection task with 10ms inter-keystroke timing.
+
+```
+┌──────────────────────────────────────────────┐
+│  ATTACK FLOW                                 │
+│                                              │
+│  1. Enter target address (from NRF Sniffer   │
+│     or manual entry)                         │
+│  2. Select payload from menu                 │
+│  3. Build HID++ keystroke packets            │
+│     (0xC1 frame, LRC checksum, CRC16)       │
+│  4. Core 0 task: inject keystrokes           │
+│  5. 10ms inter-keystroke timing              │
+│  6. Progress display shows injection status  │
+│                                              │
+│  Targets: Logitech Unifying, Dell, Microsoft │
+│  wireless keyboards (unencrypted HID)        │
+└──────────────────────────────────────────────┘
 ```
 
 #### Proto Kill
@@ -1150,8 +1271,11 @@ HaleHound-CYD/
 │
 ├── wifi_attacks.cpp/h ......... Packet Mon, Beacon, Deauth, Probe,
 │                                WiFi Scan, Captive Portal, Station Scan
-├── bluetooth_attacks.cpp/h .... BLE Jammer, Spoofer, Beacon, Sniffer, Scanner
-├── nrf24_attacks.cpp/h ........ Scanner, Analyzer, WLAN Jammer, Proto Kill
+├── bluetooth_attacks.cpp/h .... BLE Jammer, Spoofer, Beacon, Sniffer, Scanner,
+│                                WhisperPair, AirTag Hub, Phantom Flood, AirTag
+│                                Replay, Find You, BLE Ducky
+├── nrf24_attacks.cpp/h ........ Scanner, Analyzer, NRF Sniffer, MouseJack,
+│                                WLAN Jammer, Proto Kill
 ├── nrf24_config.cpp/h ......... NRF24 initialization and SPI setup
 ├── subghz_attacks.cpp/h ....... Replay, Brute Force, Jammer, Analyzer
 ├── subconfig.cpp/h ............ CC1101 initialization and SPI setup
@@ -1203,6 +1327,8 @@ Managed by PlatformIO (`lib_deps` in `platformio.ini`):
 | RF24 | ^1.4.9 | NRF24L01 driver |
 | XPT2046_Touchscreen | git | Touch controller driver |
 | SmartRC-CC1101-Driver-Lib | ^2.5.7 | CC1101 radio driver |
+| ESP32 BLE Keyboard | ^0.3.2 | BLE HID keyboard for BLE Ducky |
+| Adafruit PN532 | ^1.3.3 | PN532 NFC/RFID module driver |
 
 ---
 
@@ -1210,7 +1336,7 @@ Managed by PlatformIO (`lib_deps` in `platformio.ini`):
 
 **HaleHound-CYD** by [JesseCHale](https://github.com/JesseCHale)
 
-Based on the ESP32-DIV project. HaleHound Edition includes 8 new features, 17 bug fixes, hardware pin corrections (CC1101 TX/RX swap fix), full touchscreen support, SIGINT suite, and the CYD hardware port.
+Based on the ESP32-DIV project. HaleHound-CYD is a ground-up rewrite with 30+ attack modules, hardware pin corrections (CC1101 TX/RX swap fix), full touchscreen support, SIGINT suite, NRF24 promiscuous sniffer, MouseJack keystroke injection, AirTag attack suite, BLE HID injection, PN532 RFID/NFC, jam detection, and the CYD hardware port.
 
 GitHub: [github.com/JesseCHale/HaleHound-CYD](https://github.com/JesseCHale/HaleHound-CYD)
 

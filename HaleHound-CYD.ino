@@ -1,7 +1,7 @@
 // ═══════════════════════════════════════════════════════════════════════════
 // HaleHound-CYD Main Firmware
 // ESP32 Cheap Yellow Display Edition
-// v3.2.0 — Jam Detect, PN532 RFID/NFC, IoT Recon, Lunatic Fringe
+// v3.3.0 — NRF Sniffer, MouseJack, BLE Ducky
 // Created: 2026-02-06
 // ═══════════════════════════════════════════════════════════════════════════
 //
