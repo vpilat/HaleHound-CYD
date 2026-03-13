@@ -267,26 +267,7 @@ void cleanup();
 // ═══════════════════════════════════════════════════════════════════════════
 // FIND YOU - Stealth AirTag Clone (P-224 EC Key Rotation)
 // Broadcasts real FindMy OF advertisements using pre-generated P-224 keypairs
-// Each key rotates every 15-120s — below Apple's anti-stalking detection window
-// Owner retrieves GPS locations with matching private keys via macless-haystack
-// Based on Positive Security "Find You" research (PoPETs 2021 / ACM WiSec 2021)
-// ═══════════════════════════════════════════════════════════════════════════
-
-namespace FindYou {
-
-// Initialize BLE and draw UI
-void setup();
-
-// Main loop - touch handling, key rotation, display update
-void loop();
-
-// Check if user requested exit
-bool isExitRequested();
-
-// Cleanup BLE resources and free state
-void cleanup();
-
-}  // namespace FindYou
+// FindYou namespace removed — feature was not useful
 
 // ═══════════════════════════════════════════════════════════════════════════
 // BLE DUCKY - BLE HID Keyboard Injection

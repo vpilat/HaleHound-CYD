@@ -195,6 +195,10 @@ static bool nrfCarrierDetected() {
 
 // Initialize NRF24 hardware
 static bool nrfInit() {
+    #if CYD_DEBUG
+    Serial.printf("[NRF24] nrfInit() — heap=%d\n", ESP.getFreeHeap());
+    #endif
+
     // Configure NRF24 pins
     pinMode(NRF_CE, OUTPUT);
     pinMode(NRF_CSN, OUTPUT);
@@ -210,6 +214,9 @@ static bool nrfInit() {
     // Hat: CC1101_CS == NRF24_CSN == GPIO 27 — already deselected above via NRF_CSN
     pinMode(SD_CS, OUTPUT);
     digitalWrite(SD_CS, HIGH);   // Deselect SD card
+    // Also deselect PN532 in case RFID module left it active
+    pinMode(PN532_CS, OUTPUT);
+    digitalWrite(PN532_CS, HIGH);
 
     // Reset SPI bus with proper settle time between end/begin
     SPI.end();
@@ -231,6 +238,9 @@ static bool nrfInit() {
         nrfSetRegister(_NRF24_RF_SETUP, 0x0F);    // 2Mbps, max power
 
         byte status = nrfGetRegister(_NRF24_STATUS);
+        #if CYD_DEBUG
+        Serial.printf("[NRF24] Attempt %d: STATUS=0x%02X\n", attempt, status);
+        #endif
         if (status != 0x00 && status != 0xFF) {
             found = true;
             // Bump to full speed now that we know the chip is alive
@@ -239,6 +249,9 @@ static bool nrfInit() {
         }
     }
 
+    #if CYD_DEBUG
+    Serial.printf("[NRF24] nrfInit() %s\n", found ? "OK" : "FAILED — NRF24 not responding");
+    #endif
     return found;
 }
 
@@ -365,7 +378,15 @@ static void startScanTask() {
     scanTaskRunning = true;
     scanTaskDone = false;
     scanFrameReady = false;
-    xTaskCreatePinnedToCore(scanTask, "NrfScan", 4096, NULL, 1, &scanTaskHandle, 0);
+    BaseType_t ret = xTaskCreatePinnedToCore(scanTask, "NrfScan", 4096, NULL, 1, &scanTaskHandle, 0);
+    #if CYD_DEBUG
+    Serial.printf("[SCANNER] Task create %s (heap=%d)\n",
+                  ret == pdPASS ? "OK" : "FAILED", ESP.getFreeHeap());
+    #endif
+    if (ret != pdPASS) {
+        scanTaskHandle = NULL;
+        scanTaskRunning = false;
+    }
 }
 
 static void stopScanTask() {
@@ -1104,7 +1125,15 @@ static void startAnaTask() {
     anaTaskRunning = true;
     anaTaskDone = false;
     anaFrameReady = false;
-    xTaskCreatePinnedToCore(anaTask, "NrfAnalyze", 4096, NULL, 1, &anaTaskHandle, 0);
+    BaseType_t ret = xTaskCreatePinnedToCore(anaTask, "NrfAnalyze", 4096, NULL, 1, &anaTaskHandle, 0);
+    #if CYD_DEBUG
+    Serial.printf("[ANALYZER] Task create %s (heap=%d)\n",
+                  ret == pdPASS ? "OK" : "FAILED", ESP.getFreeHeap());
+    #endif
+    if (ret != pdPASS) {
+        anaTaskHandle = NULL;
+        anaTaskRunning = false;
+    }
 }
 
 static void stopAnaTask() {

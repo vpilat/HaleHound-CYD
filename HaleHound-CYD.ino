@@ -161,13 +161,12 @@ const unsigned char *bluetooth_submenu_icons[bluetooth_NUM_SUBMENU_ITEMS] = {
     bitmap_icon_go_back
 };
 
-// AirTag Hub Submenu - 5 items (const * const → .rodata/flash, saves DRAM)
-const int airtag_NUM_SUBMENU_ITEMS = 5;
+// AirTag Hub Submenu - 4 items (const * const → .rodata/flash, saves DRAM)
+const int airtag_NUM_SUBMENU_ITEMS = 4;
 static const char * const airtag_submenu_items_flash[] = {
     "AirTag Detect",
     "Phantom Flood",
     "AirTag Replay",
-    "Find You",
     "Back"
 };
 
@@ -175,7 +174,6 @@ static const unsigned char * const airtag_submenu_icons_flash[] = {
     bitmap_icon_scanner,
     bitmap_icon_nuke,
     bitmap_icon_antenna,
-    bitmap_icon_eye,
     bitmap_icon_go_back
 };
 
@@ -1086,7 +1084,7 @@ void handleAirTagHubTouch() {
                 displaySubmenu();
                 delay(200);
 
-                if (current_submenu_index == 4) { // Back
+                if (current_submenu_index == 3) { // Back
                     in_airtag_hub = false;
                     break;
                 }
@@ -1138,22 +1136,6 @@ void handleAirTagHubTouch() {
                             if (IS_BOOT_PRESSED()) feature_exit_requested = true;
                         }
                         AirTagReplay::cleanup();
-                        break;
-                    case 3: // Find You (Stealth AirTag Clone)
-                        if (!isOffensiveAllowed()) {
-                            if (blue_team_mode) { showBlueTeamBlockedScreen(); if (!showDisclaimerScreen()) break; }
-                            else if (!showDisclaimerScreen()) break;
-                            if (!isOffensiveAllowed()) break;
-                        }
-                        FindYou::setup();
-                        while (!feature_exit_requested) {
-                            FindYou::loop();
-                            if (FindYou::isExitRequested()) feature_exit_requested = true;
-                            touchButtonsUpdate();
-                            if (isBackButtonTapped()) feature_exit_requested = true;
-                            if (IS_BOOT_PRESSED()) feature_exit_requested = true;
-                        }
-                        FindYou::cleanup();
                         break;
                 }
 
@@ -1216,6 +1198,7 @@ void handleNRFSubmenuTouch() {
                     Scanner::scannerSetup();
                     while (!feature_exit_requested) {
                         Scanner::scannerLoop();
+                        if (Scanner::isExitRequested()) feature_exit_requested = true;
                         touchButtonsUpdate();
                         if (isBackButtonTapped()) feature_exit_requested = true;
                     }
@@ -1225,6 +1208,7 @@ void handleNRFSubmenuTouch() {
                     Analyzer::analyzerSetup();
                     while (!feature_exit_requested) {
                         Analyzer::analyzerLoop();
+                        if (Analyzer::isExitRequested()) feature_exit_requested = true;
                         touchButtonsUpdate();
                         if (isBackButtonTapped()) feature_exit_requested = true;
                     }
@@ -1264,6 +1248,7 @@ void handleNRFSubmenuTouch() {
                     WLANJammer::wlanjammerSetup();
                     while (!feature_exit_requested) {
                         WLANJammer::wlanjammerLoop();
+                        if (WLANJammer::isExitRequested()) feature_exit_requested = true;
                         touchButtonsUpdate();
                         if (isBackButtonTapped()) feature_exit_requested = true;
                     }
@@ -1278,6 +1263,7 @@ void handleNRFSubmenuTouch() {
                     ProtoKill::prokillSetup();
                     while (!feature_exit_requested) {
                         ProtoKill::prokillLoop();
+                        if (ProtoKill::isExitRequested()) feature_exit_requested = true;
                         touchButtonsUpdate();
                         if (isBackButtonTapped()) feature_exit_requested = true;
                     }
