@@ -8,6 +8,7 @@
 #include "shared.h"
 #include "gps_module.h"
 #include <EEPROM.h>
+#include <SPI.h>
 
 // ═══════════════════════════════════════════════════════════════════════════
 // THEME COLOR DEFINITIONS — default palette (Jesse's pink/purple theme)
@@ -597,4 +598,72 @@ void printSystemInfo() {
     Serial.println("  SD Card:  " + String(CYD_HAS_SDCARD ? "YES" : "NO"));
     Serial.println("═══════════════════════════════════════════════════════════");
     #endif
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// CC1101 SAFE CHECK — probe MISO before calling ELECHOUSE library
+// ═══════════════════════════════════════════════════════════════════════════
+// ELECHOUSE_CC1101_SRC_DRV has blocking while(digitalRead(MISO)) loops
+// in SpiStrobe(), SpiReadStatus(), SpiReadReg(), SpiWriteReg() — ALL of
+// them wait for MISO LOW (CC1101 "ready" signal). With no CC1101 on the
+// bus, MISO floats HIGH → infinite loop → board freeze.
+//
+// This function does a raw SPI probe: assert CC1101 CS, wait up to 50ms
+// for MISO to go LOW. If it does, CC1101 is present and ELECHOUSE is safe.
+// If not, return false and skip all ELECHOUSE calls.
+
+bool cc1101SafeCheck() {
+    // Deselect all other SPI devices
+    pinMode(NRF24_CSN, OUTPUT);   digitalWrite(NRF24_CSN, HIGH);
+    pinMode(SD_CS, OUTPUT);       digitalWrite(SD_CS, HIGH);
+    #ifdef PN532_CS
+    pinMode(PN532_CS, OUTPUT);    digitalWrite(PN532_CS, HIGH);
+    #endif
+
+    SPI.begin(VSPI_SCK, VSPI_MISO, VSPI_MOSI);
+    SPI.beginTransaction(SPISettings(1000000, MSBFIRST, SPI_MODE0));
+    pinMode(CC1101_CS, OUTPUT);
+
+    // CC1101 manual reset: CS toggle sequence per datasheet Section 19.1.2
+    digitalWrite(CC1101_CS, HIGH);
+    delayMicroseconds(50);
+    digitalWrite(CC1101_CS, LOW);
+    delayMicroseconds(50);
+    digitalWrite(CC1101_CS, HIGH);
+    delayMicroseconds(50);
+
+    // Assert CS and try SRES (0x30) strobe — don't wait for MISO (may not work on all modules)
+    digitalWrite(CC1101_CS, LOW);
+    delay(1);
+    SPI.transfer(0x30);  // CC1101_SRES — reset chip
+    digitalWrite(CC1101_CS, HIGH);
+    delay(10);  // Wait for CC1101 to finish reset (~100us typical, 10ms generous)
+
+    // Now try reading VERSION register (0x31 | 0xC0 = 0xF1 for status read)
+    // Do 3 attempts — first read after reset can return garbage
+    bool found = false;
+    for (int attempt = 0; attempt < 3 && !found; attempt++) {
+        digitalWrite(CC1101_CS, LOW);
+        delayMicroseconds(100);  // Give CC1101 time to pull MISO (skip blocking wait)
+        byte status = SPI.transfer(0xF1);   // 0x31 | 0xC0 = Read status register 0x31 (VERSION)
+        byte version = SPI.transfer(0x00);  // Clock out the response
+        digitalWrite(CC1101_CS, HIGH);
+
+        Serial.printf("[CC1101-SAFE] Attempt %d: status=0x%02X version=0x%02X MISO=%d CS=GPIO%d\n",
+                      attempt, status, version, digitalRead(VSPI_MISO), CC1101_CS);
+
+        // Genuine CC1101 returns 0x14, clones may return other non-zero/non-FF values
+        if (version > 0x00 && version != 0xFF) {
+            found = true;
+        }
+        delay(2);
+    }
+
+    Serial.printf("[CC1101-SAFE] Result: %s\n", found ? "DETECTED" : "NOT FOUND");
+
+    SPI.endTransaction();
+    SPI.end();
+    delay(5);
+
+    return found;
 }

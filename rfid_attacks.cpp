@@ -233,6 +233,68 @@ static void clearContentArea() {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
+// SCROLL HELPERS — shared scrollable data list support
+// ═══════════════════════════════════════════════════════════════════════════
+
+#define SCROLL_BAR_H      16
+#define SCROLL_BAR_Y      (SCREEN_HEIGHT - SCROLL_BAR_H)
+#define SCROLL_ROW_H      13
+
+static void drawScrollBar(int offset, int total, int visible) {
+    tft.fillRect(0, SCROLL_BAR_Y, SCREEN_WIDTH, SCROLL_BAR_H, TFT_BLACK);
+
+    if (total <= visible) {
+        drawCenteredRFID(SCROLL_BAR_Y + 3, "BACK to exit", HALEHOUND_GUNMETAL);
+        return;
+    }
+
+    if (offset > 0) {
+        tft.setTextColor(HALEHOUND_MAGENTA, TFT_BLACK);
+        tft.setCursor(6, SCROLL_BAR_Y + 3);
+        tft.print("[UP]");
+    }
+
+    char buf[16];
+    int endIdx = offset + visible;
+    if (endIdx > total) endIdx = total;
+    snprintf(buf, sizeof(buf), "%d-%d / %d", offset + 1, endIdx, total);
+    drawCenteredRFID(SCROLL_BAR_Y + 3, buf, HALEHOUND_GUNMETAL);
+
+    if (offset + visible < total) {
+        tft.setTextColor(HALEHOUND_MAGENTA, TFT_BLACK);
+        tft.setCursor(SCREEN_WIDTH - 30, SCROLL_BAR_Y + 3);
+        tft.print("[DN]");
+    }
+}
+
+static bool handleScrollTouch(int& offset, int total, int visible) {
+    if (total <= visible) return false;
+    if (!isTouched()) return false;
+
+    int tx = getTouchX();
+    int ty = getTouchY();
+    if (tx < 0 || ty < 0) return false;
+    if (ty < SCROLL_BAR_Y - 4) return false;
+
+    if (tx < SCREEN_WIDTH / 3 && offset > 0) {
+        offset -= visible;
+        if (offset < 0) offset = 0;
+        waitForTouchRelease();
+        return true;
+    }
+
+    if (tx > SCREEN_WIDTH * 2 / 3 && offset + visible < total) {
+        offset += visible;
+        if (offset > total - visible) offset = total - visible;
+        if (offset < 0) offset = 0;
+        waitForTouchRelease();
+        return true;
+    }
+
+    return false;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
 // PN532 INIT / CLEANUP
 // ═══════════════════════════════════════════════════════════════════════════
 
@@ -704,6 +766,28 @@ static void saveDumpToSD() {
 #define RDR_DUMP_TITLE_Y 142
 #define RDR_DUMP_DATA_Y  156
 
+static void drawReaderPage() {
+    int maxVisible = (SCROLL_BAR_Y - RDR_DUMP_DATA_Y) / SCROLL_ROW_H;
+    tft.fillRect(0, RDR_DUMP_DATA_Y, SCREEN_WIDTH, SCROLL_BAR_Y - RDR_DUMP_DATA_Y, TFT_BLACK);
+    tft.setTextSize(TEXT_SIZE_BODY);
+    int ry = RDR_DUMP_DATA_Y;
+    for (int i = 0; i < maxVisible && (displayOffset + i) < totalSectors; i++) {
+        int s = displayOffset + i;
+        tft.setTextColor(sectorReadOk[s] ? rfidGradientColor((float)s / totalSectors) : HALEHOUND_HOTPINK, TFT_BLACK);
+        tft.setCursor(2, ry);
+        tft.printf("S%02d:", s);
+        tft.setTextColor(HALEHOUND_GUNMETAL, TFT_BLACK);
+        tft.setCursor(28, ry);
+        for (int j = 0; j < 8; j++) {
+            tft.printf("%02X", sectorData[s][0][j]);
+        }
+        tft.setTextColor(tft.color565(40, 40, 60), TFT_BLACK);
+        tft.print("..");
+        ry += SCROLL_ROW_H;
+    }
+    drawScrollBar(displayOffset, totalSectors, maxVisible);
+}
+
 void setup() {
     exitRequested = false;
     state = READER_WAIT_CARD;
@@ -856,32 +940,20 @@ void loop() {
                 tft.setCursor(10, RDR_DUMP_TITLE_Y);
                 tft.print("Sector data:");
 
-                int y = RDR_DUMP_DATA_Y;
-                int maxDisplay = (SCREEN_HEIGHT - 10 - y) / 13;
-                if (maxDisplay > totalSectors) maxDisplay = totalSectors;
-
-                for (int s = 0; s < maxDisplay; s++) {
-                    // Sector label with color coding
-                    tft.setTextColor(sectorReadOk[s] ? rfidGradientColor((float)s / totalSectors) : HALEHOUND_HOTPINK, TFT_BLACK);
-                    tft.setCursor(2, y);
-                    tft.printf("S%02d:", s);
-
-                    // Hex data — compact, 8 bytes per line
-                    tft.setTextColor(HALEHOUND_GUNMETAL, TFT_BLACK);
-                    tft.setCursor(28, y);
-                    for (int i = 0; i < 8; i++) {
-                        tft.printf("%02X", sectorData[s][0][i]);
-                    }
-                    tft.setTextColor(tft.color565(40, 40, 60), TFT_BLACK);
-                    tft.print("..");
-                    y += 13;
-                }
+                displayOffset = 0;
+                drawReaderPage();
             }
             break;
         }
 
-        case READER_DISPLAY:
+        case READER_DISPLAY: {
+            int maxVisible = (SCROLL_BAR_Y - RDR_DUMP_DATA_Y) / SCROLL_ROW_H;
+            if (handleScrollTouch(displayOffset, totalSectors, maxVisible)) {
+                drawReaderPage();
+            }
+            delay(30);
             break;
+        }
 
         case READER_DONE:
             break;
@@ -1301,6 +1373,8 @@ static volatile int foundCount = 0;
 static volatile bool bruteRunning = false;
 static volatile bool bruteDone = false;
 static volatile bool frameReady = false;
+static bool resultsShown = false;  // Prevents done handler from looping
+static int scrollOffset = 0;      // Scroll offset for results display
 static TaskHandle_t bruteTaskHandle = NULL;
 
 static uint8_t bruteUid[7] = {0};
@@ -1313,17 +1387,38 @@ static uint8_t foundKeyB[MAX_SECTORS][6];
 static bool hasKeyA[MAX_SECTORS];
 static bool hasKeyB[MAX_SECTORS];
 
+// Re-activate card after failed auth (MIFARE Classic enters HALT state on wrong key)
+static bool reactivateCard() {
+    uint8_t tmpUid[7];
+    uint8_t tmpLen = 0;
+    return nfc.readPassiveTargetID(PN532_MIFARE_ISO14443A, tmpUid, &tmpLen, 50);
+}
+
 // Core 0 brute force task
 static void bruteForceTask(void* param) {
     uint8_t keyBuf[6];
+    Serial.printf("[BRUTE] Task started on Core %d, sectors=%d, keys=%d\n",
+                  xPortGetCoreID(), bruteTotalSectors, NUM_BRUTE_KEYS);
 
     for (int s = 0; s < bruteTotalSectors && bruteRunning; s++) {
         bruteSector = s;
         int firstBlock = s * BLOCKS_PER_SECTOR;
+        Serial.printf("[BRUTE] Sector %d (block %d)\n", s, firstBlock);
+        bool needReactivate = false;
 
         for (int k = 0; k < NUM_BRUTE_KEYS && bruteRunning; k++) {
             bruteKeyIdx = k;
             memcpy(keyBuf, bruteKeys[k], 6);
+
+            // Re-activate card if previous auth failed (card HALTed)
+            if (needReactivate) {
+                if (!reactivateCard()) {
+                    Serial.printf("[BRUTE] Card lost at S%d K%d — stopping\n", s, k);
+                    bruteRunning = false;
+                    break;
+                }
+                needReactivate = false;
+            }
 
             // Try Key A
             if (!hasKeyA[s]) {
@@ -1332,28 +1427,53 @@ static void bruteForceTask(void* param) {
                     hasKeyA[s] = true;
                     foundCount++;
                     frameReady = true;
+                    Serial.printf("[BRUTE] S%d KeyA FOUND: %02X%02X%02X%02X%02X%02X\n",
+                                  s, keyBuf[0], keyBuf[1], keyBuf[2], keyBuf[3], keyBuf[4], keyBuf[5]);
+                    needReactivate = true; // Auth changes card state, re-activate for next attempt
+                } else {
+                    needReactivate = true; // Failed auth → card HALTed
                 }
             }
 
-            // Try Key B
+            // Try Key B (re-activate first if Key A attempt changed card state)
             if (!hasKeyB[s]) {
+                if (needReactivate) {
+                    if (!reactivateCard()) {
+                        Serial.printf("[BRUTE] Card lost at S%d K%d KeyB — stopping\n", s, k);
+                        bruteRunning = false;
+                        break;
+                    }
+                    needReactivate = false;
+                }
                 if (nfc.mifareclassic_AuthenticateBlock(bruteUid, bruteUidLen, firstBlock, 1, keyBuf)) {
                     memcpy(foundKeyB[s], bruteKeys[k], 6);
                     hasKeyB[s] = true;
                     foundCount++;
                     frameReady = true;
+                    Serial.printf("[BRUTE] S%d KeyB FOUND: %02X%02X%02X%02X%02X%02X\n",
+                                  s, keyBuf[0], keyBuf[1], keyBuf[2], keyBuf[3], keyBuf[4], keyBuf[5]);
+                    needReactivate = true;
+                } else {
+                    needReactivate = true;
                 }
             }
 
             // Both found for this sector, move on
             if (hasKeyA[s] && hasKeyB[s]) break;
+
+            // Yield every 4 keys to prevent Core 0 watchdog timeout
+            if (k % 4 == 3) delay(1);
         }
     }
 
+    Serial.printf("[BRUTE] Task done — found %d keys\n", foundCount);
     bruteDone = true;
     bruteRunning = false;
-    bruteTaskHandle = NULL;
-    vTaskDelete(NULL);
+    // Only delete task if running as a FreeRTOS task (not called inline)
+    if (bruteTaskHandle) {
+        bruteTaskHandle = NULL;
+        vTaskDelete(NULL);
+    }
 }
 
 static void saveKeysToSD() {
@@ -1422,11 +1542,47 @@ static void saveKeysToSD() {
 #define BRT_BAR_Y        SCALE_Y(128)
 #define BRT_BAR_H        SCALE_H(12)
 #define BRT_RESULTS_Y    SCALE_Y(150)
+#define BRT_DATA_Y       (BRT_RESULTS_Y + 14)
+
+static void drawBrutePage() {
+    int maxVisible = (SCROLL_BAR_Y - BRT_DATA_Y) / SCROLL_ROW_H;
+    tft.fillRect(0, BRT_DATA_Y, SCREEN_WIDTH, SCROLL_BAR_Y - BRT_DATA_Y, TFT_BLACK);
+    tft.setTextSize(TEXT_SIZE_BODY);
+    int ry = BRT_DATA_Y;
+    for (int i = 0; i < maxVisible && (scrollOffset + i) < bruteTotalSectors; i++) {
+        int s = scrollOffset + i;
+        float sRatio = (float)s / (float)bruteTotalSectors;
+        tft.setTextColor(rfidGradientColor(sRatio), TFT_BLACK);
+        tft.setCursor(2, ry);
+        tft.printf("S%02d ", s);
+        if (hasKeyA[s]) {
+            tft.setTextColor(HALEHOUND_GREEN, TFT_BLACK);
+            tft.print("A:");
+            for (int j = 0; j < 6; j++) tft.printf("%02X", foundKeyA[s][j]);
+        } else {
+            tft.setTextColor(HALEHOUND_GUNMETAL, TFT_BLACK);
+            tft.print("A:------------");
+        }
+        tft.print(" ");
+        if (hasKeyB[s]) {
+            tft.setTextColor(HALEHOUND_GREEN, TFT_BLACK);
+            tft.print("B:");
+            for (int j = 0; j < 6; j++) tft.printf("%02X", foundKeyB[s][j]);
+        } else {
+            tft.setTextColor(HALEHOUND_GUNMETAL, TFT_BLACK);
+            tft.print("B:------------");
+        }
+        ry += SCROLL_ROW_H;
+    }
+    drawScrollBar(scrollOffset, bruteTotalSectors, maxVisible);
+}
 
 void setup() {
     exitRequested = false;
     bruteDone = false;
     bruteRunning = false;
+    resultsShown = false;
+    scrollOffset = 0;
     foundCount = 0;
     bruteSector = 0;
     bruteKeyIdx = 0;
@@ -1482,6 +1638,12 @@ void loop() {
             memcpy(bruteUid, uid, uidLen);
             bruteUidLen = uidLen;
 
+            Serial.printf("[BRUTE] Card detected! UID=");
+            for (int i = 0; i < uidLen; i++) Serial.printf("%02X", uid[i]);
+            Serial.printf(" SAK=0x%02X uidLen=%d\n", sak, uidLen);
+            Serial.printf("[BRUTE] Free heap: %d, largest block: %d\n",
+                          ESP.getFreeHeap(), ESP.getMaxAllocHeap());
+
             if (!isMifareClassic(sak)) {
                 clearContentArea();
                 drawRFIDTitle(BRT_TITLE_Y, "KEY BRUTE");
@@ -1515,16 +1677,11 @@ void loop() {
 #if RFID_DEMO_MODE
             // Demo: don't launch real task — simulate progress in loop()
 #else
-            // Launch brute force on Core 0
-            xTaskCreatePinnedToCore(
-                bruteForceTask,
-                "rfidBrute",
-                8192,
-                NULL,
-                1,
-                &bruteTaskHandle,
-                0  // Core 0
-            );
+            Serial.println("[BRUTE] Running brute force inline (Core 1)...");
+            // Run brute force INLINE on Core 1 — no dual-core task
+            // This blocks the display during execution but eliminates SPI conflicts
+            bruteForceTask(NULL);
+            Serial.println("[BRUTE] Inline brute force returned");
 #endif
         }
         return;
@@ -1556,65 +1713,67 @@ void loop() {
     }
 #endif
 
-    // Update display from Core 1 (main loop)
-    if (bruteRunning || bruteDone) {
-        // Progress text
+    // Results screen — handle scroll and wait for BACK
+    if (resultsShown) {
+        int maxVisible = (SCROLL_BAR_Y - BRT_DATA_Y) / SCROLL_ROW_H;
+        if (handleScrollTouch(scrollOffset, bruteTotalSectors, maxVisible)) {
+            drawBrutePage();
+        }
+        delay(30);
+        return;
+    }
+
+    // Results display — runs once when brute force completes
+    if (bruteDone && !resultsShown) {
+        resultsShown = true;
+        scrollOffset = 0;
+
+        // Fill progress bar to 100%
+        int barW = SCREEN_WIDTH - 40;
+        drawGradientBar(20, BRT_BAR_Y, barW, BRT_BAR_H, barW);
+
+        // Update progress text to final status
+        tft.fillRect(10, BRT_PROGRESS_Y, SCREEN_WIDTH - 20, 28, TFT_BLACK);
+        tft.setTextSize(TEXT_SIZE_BODY);
+        tft.setTextColor(HALEHOUND_GREEN, TFT_BLACK);
+        tft.setCursor(10, BRT_PROGRESS_Y);
+        tft.printf("Done! %d keys found", foundCount);
+
+        // Results section header
+        tft.fillRect(0, BRT_RESULTS_Y - 4, SCREEN_WIDTH, SCREEN_HEIGHT - BRT_RESULTS_Y + 4, TFT_BLACK);
+        drawRFIDSeparator(BRT_RESULTS_Y - 4);
+        drawCenteredRFID(BRT_RESULTS_Y, "BRUTE FORCE COMPLETE", HALEHOUND_GREEN);
+
+        // Draw first page of sector results
+        drawBrutePage();
+
+#if !RFID_DEMO_MODE
+        saveKeysToSD();
+        delay(50);
+        pn532Cleanup();
+#endif
+
+        Serial.printf("[BRUTE] Complete — %d keys found. Waiting for user.\n", foundCount);
+        return;
+    }
+
+    // Progress display — only visible in demo mode or if using Core 0 task
+    if (bruteRunning) {
         tft.fillRect(10, BRT_PROGRESS_Y, SCREEN_WIDTH - 20, 14, TFT_BLACK);
         tft.setTextColor(HALEHOUND_MAGENTA, TFT_BLACK);
         tft.setCursor(10, BRT_PROGRESS_Y);
         tft.printf("Sector: %d/%d  Key: %d/%d", bruteSector + 1, bruteTotalSectors, bruteKeyIdx + 1, NUM_BRUTE_KEYS);
 
-        // Found count with pulsing color
         tft.fillRect(10, BRT_PROGRESS_Y + 14, SCREEN_WIDTH - 20, 12, TFT_BLACK);
         tft.setTextColor(foundCount > 0 ? rfidPulseColor(millis()) : HALEHOUND_GUNMETAL, TFT_BLACK);
         tft.setCursor(10, BRT_PROGRESS_Y + 14);
         tft.printf("Found: %d keys", foundCount);
 
-        // Gradient progress bar
         int barW = SCREEN_WIDTH - 40;
         int totalWork = bruteTotalSectors * NUM_BRUTE_KEYS;
         int currentWork = bruteSector * NUM_BRUTE_KEYS + bruteKeyIdx;
         int fillW = totalWork > 0 ? (currentWork * barW) / totalWork : 0;
         drawGradientBar(20, BRT_BAR_Y, barW, BRT_BAR_H, fillW);
-
-        if (bruteDone) {
-            // Full bar
-            drawGradientBar(20, BRT_BAR_Y, barW, BRT_BAR_H, barW);
-
-            drawRFIDSeparator(BRT_RESULTS_Y - 4);
-
-            drawCenteredRFID(BRT_RESULTS_Y, "BRUTE FORCE COMPLETE", HALEHOUND_GREEN);
-            int ry = BRT_RESULTS_Y + 16;
-
-            // Show results per sector with gradient-colored labels
-            int maxShow = (SCREEN_HEIGHT - 10 - ry) / 13;
-            if (maxShow > bruteTotalSectors) maxShow = bruteTotalSectors;
-
-            for (int s = 0; s < maxShow; s++) {
-                float sRatio = (float)s / (float)bruteTotalSectors;
-                tft.setTextColor(rfidGradientColor(sRatio), TFT_BLACK);
-                tft.setCursor(2, ry);
-                tft.printf("S%02d:", s);
-                if (hasKeyA[s]) {
-                    tft.setTextColor(HALEHOUND_GREEN, TFT_BLACK);
-                    tft.print("A=");
-                    for (int i = 0; i < 6; i++) tft.printf("%02X", foundKeyA[s][i]);
-                } else {
-                    tft.setTextColor(HALEHOUND_HOTPINK, TFT_BLACK);
-                    tft.print("A=??????      ");
-                }
-                ry += 13;
-            }
-
-#if !RFID_DEMO_MODE
-            saveKeysToSD();
-            delay(50);
-            pn532Init();
-#endif
-
-            bruteDone = false;
-            bruteRunning = false;
-        }
 
         frameReady = false;
     }

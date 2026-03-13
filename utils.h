@@ -135,4 +135,14 @@ void printHeapStatus();
 // Print system info
 void printSystemInfo();
 
+// ═══════════════════════════════════════════════════════════════════════════
+// CC1101 SAFE CHECK
+// ═══════════════════════════════════════════════════════════════════════════
+
+// Pre-check if CC1101 is connected before calling ELECHOUSE library.
+// ELECHOUSE has blocking while(digitalRead(MISO)) loops that freeze
+// forever if no CC1101 is on the bus. This does a raw SPI probe with
+// 50ms timeout — returns true if CC1101 pulled MISO LOW (ready).
+bool cc1101SafeCheck();
+
 #endif // UTILS_H

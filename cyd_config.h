@@ -385,8 +385,10 @@
 #endif
 
 // Helper macro — replaces all direct digitalRead(0) == LOW checks
+// When E07 PA module is active, GPIO 0 = CC1101_RX_EN (OUTPUT) — not a button.
+// cc1101_pa_module check prevents false BOOT triggers that freeze the UI.
 #if BOOT_BUTTON_USABLE
-  #define IS_BOOT_PRESSED() (digitalRead(BOOT_BUTTON) == LOW)
+  #define IS_BOOT_PRESSED() (digitalRead(BOOT_BUTTON) == LOW && !cc1101_pa_module)
 #else
   #define IS_BOOT_PRESSED() (false)
 #endif

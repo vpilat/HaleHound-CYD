@@ -248,7 +248,7 @@ static volatile bool fftTaskRunning = false;
 
 // Shared FFT result buffer — Core 0 writes, Core 1 reads
 #define FFT_LINE_WIDTH (SCREEN_WIDTH / 2)  // half of screen width
-static volatile int fftKValues[FFT_LINE_WIDTH];
+static volatile int* fftKValues = nullptr;
 static volatile int fftMaxK = 0;
 static volatile bool fftFrameReady = false;
 
@@ -799,6 +799,11 @@ static bool decodeRmtSignal(rmt_item32_t* items, size_t itemCount,
 void setup() {
     if (initialized) return;
 
+    // Heap-allocate FFT k-value buffer (saves DRAM .bss for 3.5" CYD)
+    if (!fftKValues) {
+        fftKValues = (volatile int*)calloc(FFT_LINE_WIDTH, sizeof(int));
+    }
+
     #if CYD_DEBUG
     Serial.println("[SUBGHZ] Initializing Replay Attack...");
     #endif
@@ -816,6 +821,14 @@ void setup() {
     // Reset SPI bus so ELECHOUSE can configure fresh (same pattern as working NRF24)
     SPI.end();
     delay(5);
+
+    // Safe check — ELECHOUSE has blocking MISO loops that freeze with no CC1101
+    if (!cc1101SafeCheck()) {
+        #if CYD_DEBUG
+        Serial.println("[REPLAY] CC1101 not detected (safe check)");
+        #endif
+        return;
+    }
 
     // Configure CC1101 SPI and GDO pins
     ELECHOUSE_cc1101.setSpiPin(RADIO_SPI_SCK, RADIO_SPI_MISO, RADIO_SPI_MOSI, CC1101_CS);
@@ -1125,6 +1138,7 @@ void cleanup() {
     initialized = false;
     exitRequested = false;
     fftFrameReady = false;
+    if (fftKValues) { free((void*)fftKValues); fftKValues = nullptr; }
 
     #if CYD_DEBUG
     Serial.println("[SUBGHZ] Cleanup complete");
@@ -1990,6 +2004,14 @@ void setup() {
     SPI.end();
     delay(5);
 
+    // Safe check — ELECHOUSE has blocking MISO loops that freeze with no CC1101
+    if (!cc1101SafeCheck()) {
+        #if CYD_DEBUG
+        Serial.println("[JAMMER] CC1101 not detected (safe check)");
+        #endif
+        return;
+    }
+
     // Configure CC1101 SPI and GDO pins
     ELECHOUSE_cc1101.setSpiPin(RADIO_SPI_SCK, RADIO_SPI_MISO, RADIO_SPI_MOSI, CC1101_CS);
     ELECHOUSE_cc1101.setGDO(CC1101_GDO0, CC1101_GDO2);
@@ -2764,6 +2786,14 @@ void setup() {
     // Reset SPI bus so ELECHOUSE can configure fresh
     SPI.end();
     delay(5);
+
+    // Safe check — ELECHOUSE has blocking MISO loops that freeze with no CC1101
+    if (!cc1101SafeCheck()) {
+        #if CYD_DEBUG
+        Serial.println("[BRUTE] CC1101 not detected (safe check)");
+        #endif
+        return;
+    }
 
     // Configure CC1101 SPI and GDO pins
     ELECHOUSE_cc1101.setSpiPin(RADIO_SPI_SCK, RADIO_SPI_MISO, RADIO_SPI_MOSI, CC1101_CS);
@@ -3608,6 +3638,14 @@ void setup() {
     SPI.end();
     delay(5);
 
+    // Safe check — ELECHOUSE has blocking MISO loops that freeze with no CC1101
+    if (!cc1101SafeCheck()) {
+        #if CYD_DEBUG
+        Serial.println("[ANALYZER] CC1101 not detected (safe check)");
+        #endif
+        return;
+    }
+
     // Configure CC1101
     ELECHOUSE_cc1101.setSpiPin(RADIO_SPI_SCK, RADIO_SPI_MISO, RADIO_SPI_MOSI, CC1101_CS);
     ELECHOUSE_cc1101.setGDO(CC1101_GDO0, CC1101_GDO2);
@@ -3811,6 +3849,14 @@ void cc1101Init() {
     // Reset SPI bus so ELECHOUSE can configure fresh
     SPI.end();
     delay(5);
+
+    // Safe check — ELECHOUSE has blocking MISO loops that freeze with no CC1101
+    if (!cc1101SafeCheck()) {
+        #if CYD_DEBUG
+        Serial.println("[CC1101] Not detected (safe check)");
+        #endif
+        return;
+    }
 
     // Configure CC1101 SPI and GDO pins
     ELECHOUSE_cc1101.setSpiPin(RADIO_SPI_SCK, RADIO_SPI_MISO, RADIO_SPI_MOSI, CC1101_CS);

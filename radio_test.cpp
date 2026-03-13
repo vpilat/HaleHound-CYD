@@ -198,7 +198,17 @@ static void runCC1101Test(int statusY, int hintY) {
     pinMode(NRF24_CSN, OUTPUT);   digitalWrite(NRF24_CSN, HIGH);
     pinMode(SD_CS, OUTPUT);       digitalWrite(SD_CS, HIGH);
 
-    // Configure ELECHOUSE with our SPI and GDO pins
+    // Pre-check: ELECHOUSE library has blocking while(digitalRead(MISO))
+    // that freezes forever if no CC1101 is connected. Safe probe first.
+    if (!cc1101SafeCheck()) {
+        drawStatusLine(statusY, "FAIL  No CC1101 detected", TFT_RED);
+        char hint[48];
+        snprintf(hint, sizeof(hint), "Check CS (GPIO %d) and 3.3V power", CC1101_CS);
+        drawStatusLine(hintY, hint, TFT_YELLOW);
+        return;
+    }
+
+    // CC1101 responded on SPI — safe to use ELECHOUSE library now
     ELECHOUSE_cc1101.setSpiPin(VSPI_SCK, VSPI_MISO, VSPI_MOSI, CC1101_CS);
     ELECHOUSE_cc1101.setGDO(CC1101_GDO0, CC1101_GDO2);
 

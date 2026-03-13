@@ -66,7 +66,7 @@ static volatile bool pmFftTaskDone = false;
 
 // Shared FFT results — Core 0 writes, Core 1 reads when fftFrameReady
 #define PM_HALF_WIDTH (SCREEN_WIDTH / 2)   // Half screen width for mirrored FFT display
-static volatile int pmKValues[PM_HALF_WIDTH];
+static volatile int* pmKValues = nullptr;
 static volatile int pmMaxK = 0;
 static volatile bool fftFrameReady = false;
 static volatile uint32_t pmDisplayPktCount = 0;  // snapshot for Core 1 display
@@ -246,7 +246,7 @@ static void drawFftFrame() {
     // ─── AREA GRAPH — RIGHT SIDE ────────────────────────────────────────
     static int last_y[256] = {0};
 
-    tft.fillRect(center_x, area_graph_y, half_width, area_graph_height, HALEHOUND_BLACK);
+    tft.fillRect(center_x, area_graph_y, center_x, area_graph_height, HALEHOUND_BLACK);
     for (int j = 0; j < (int)half_width; j++) {
         int k = pmKValues[j];
         unsigned int color = palette_red[k] << 11 | palette_green[k] << 5 | palette_blue[k];
@@ -260,7 +260,7 @@ static void drawFftFrame() {
     }
 
     // ─── AREA GRAPH — LEFT SIDE (mirrored) ──────────────────────────────
-    tft.fillRect(0, area_graph_y, half_width, area_graph_height, HALEHOUND_BLACK);
+    tft.fillRect(0, area_graph_y, center_x, area_graph_height, HALEHOUND_BLACK);
     for (int j = 0; j < (int)half_width; j++) {
         int k = pmKValues[j];
         unsigned int color = palette_red[k] << 11 | palette_green[k] << 5 | palette_blue[k];
@@ -497,6 +497,11 @@ void setup() {
     // Skip hardware init if already done
     if (initialized) return;
 
+    // Heap-allocate FFT k-value buffer (saves DRAM .bss for 3.5" CYD)
+    if (!pmKValues) {
+        pmKValues = (volatile int*)calloc(PM_HALF_WIDTH, sizeof(int));
+    }
+
     // Initialize FFT parameters
     sampling_period_us = round(1000000 * (1.0 / samplingFrequency));
     initPalette();
@@ -710,6 +715,7 @@ void cleanup() {
     initialized = false;
     exitRequested = false;
     fftFrameReady = false;
+    if (pmKValues) { free((void*)pmKValues); pmKValues = nullptr; }
 
     #if CYD_DEBUG
     Serial.println("[PKTMON] Cleanup complete — Core 0 FFT task terminated");

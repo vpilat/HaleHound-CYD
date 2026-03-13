@@ -920,6 +920,20 @@ void setup() {
     SPI.end();
     delay(5);
 
+    // Safe check — ELECHOUSE has blocking MISO loops that freeze with no CC1101
+    if (!cc1101SafeCheck()) {
+        tft.setTextColor(HALEHOUND_HOTPINK);
+        tft.setCursor(10, 100);
+        tft.print("CC1101 NOT FOUND");
+        tft.setTextColor(HALEHOUND_GUNMETAL);
+        tft.setCursor(10, 115);
+        tft.print("Check SPI wiring");
+        delay(2000);
+        exitRequested = true;
+        initialized = true;
+        return;
+    }
+
     ELECHOUSE_cc1101.setSpiPin(RADIO_SPI_SCK, RADIO_SPI_MISO, RADIO_SPI_MOSI, CC1101_CS);
     ELECHOUSE_cc1101.setGDO(CC1101_GDO0, CC1101_GDO2);
 
@@ -1607,6 +1621,7 @@ static void fsScanSubGHz() {
     digitalWrite(NRF24_CSN, HIGH);
     digitalWrite(NRF24_CE, LOW);
     SPI.end(); delay(2);
+    if (!cc1101SafeCheck()) return;
     ELECHOUSE_cc1101.setSpiPin(RADIO_SPI_SCK, RADIO_SPI_MISO, RADIO_SPI_MOSI, CC1101_CS);
     ELECHOUSE_cc1101.setGDO(CC1101_GDO0, CC1101_GDO2);
     if (!ELECHOUSE_cc1101.getCC1101()) return;

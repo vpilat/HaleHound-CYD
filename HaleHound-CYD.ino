@@ -2648,11 +2648,11 @@ void cc1101ModuleLoop() {
                 pinMode(CC1101_TX_EN, OUTPUT);
                 pinMode(CC1101_RX_EN, OUTPUT);
                 digitalWrite(CC1101_TX_EN, LOW);
-                digitalWrite(CC1101_RX_EN, LOW);
+                digitalWrite(CC1101_RX_EN, HIGH);  // RX mode default — keeps GPIO0 HIGH (BOOT safe)
                 Serial.println("[CC1101] PA module enabled — TX_EN/RX_EN pins active");
             } else {
                 digitalWrite(CC1101_TX_EN, LOW);
-                digitalWrite(CC1101_RX_EN, LOW);
+                pinMode(CC1101_RX_EN, INPUT_PULLUP);  // Return to BOOT button mode
                 Serial.println("[CC1101] PA module disabled — standard mode");
             }
             #endif
@@ -3769,8 +3769,8 @@ void activateValhalla() {
 // ═══════════════════════════════════════════════════════════════════════════
 
 void handleButtons() {
-    // Screen sleep check
-    if (screen_timeout_seconds > 0 && !screen_asleep) {
+    // Screen sleep check — disabled while a feature is active (jammers, attacks, etc.)
+    if (screen_timeout_seconds > 0 && !screen_asleep && !feature_active) {
         if (millis() - last_interaction_time > (unsigned long)screen_timeout_seconds * 1000) {
             ledcWrite(0, 0);
             screen_asleep = true;
@@ -4019,10 +4019,14 @@ void runBootDiagnostics() {
     pinMode(SD_CS, OUTPUT);
     digitalWrite(SD_CS, HIGH);
 
-    ELECHOUSE_cc1101.setSpiPin(VSPI_SCK, VSPI_MISO, VSPI_MOSI, CC1101_CS);
-    ELECHOUSE_cc1101.setGDO(CC1101_GDO0, CC1101_GDO2);
-
-    bool cc1101Found = ELECHOUSE_cc1101.getCC1101();
+    // Safe CC1101 check — ELECHOUSE library has blocking while(MISO)
+    // loops that freeze forever if no CC1101 is connected
+    bool cc1101Found = false;
+    if (cc1101SafeCheck()) {
+        ELECHOUSE_cc1101.setSpiPin(VSPI_SCK, VSPI_MISO, VSPI_MOSI, CC1101_CS);
+        ELECHOUSE_cc1101.setGDO(CC1101_GDO0, CC1101_GDO2);
+        cc1101Found = ELECHOUSE_cc1101.getCC1101();
+    }
 
     tft.setCursor(5, y);
     if (cc1101Found) {
@@ -4293,8 +4297,8 @@ void setup() {
         pinMode(CC1101_TX_EN, OUTPUT);
         pinMode(CC1101_RX_EN, OUTPUT);
         digitalWrite(CC1101_TX_EN, LOW);
-        digitalWrite(CC1101_RX_EN, LOW);
-        Serial.println("[INIT] CC1101 PA module — TX_EN/RX_EN pins initialized");
+        digitalWrite(CC1101_RX_EN, HIGH);  // RX mode default — keeps GPIO0 HIGH (BOOT safe)
+        Serial.println("[INIT] CC1101 PA module — TX_EN/RX_EN pins initialized (RX mode)");
     }
     #endif
 

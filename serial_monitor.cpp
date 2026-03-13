@@ -32,8 +32,8 @@ extern TFT_eSPI tft;
 // STATE
 // =============================================================================
 
-// Ring buffer - 64 lines x 41 bytes = 2.6KB
-static char ringBuffer[RING_SIZE][TERM_COLS + 1];
+// Ring buffer — heap-allocated to save DRAM (.bss)
+static char (*ringBuffer)[TERM_COLS + 1] = nullptr;
 static int ringHead = 0;
 static int ringCount = 0;
 
@@ -497,6 +497,19 @@ void serialMonitorScreen() {
     monPaused = false;
     totalBytesRx = 0;
     lineBufPos = 0;
+
+    // Heap-allocate ring buffer (saves ~3.4KB DRAM on 3.5" CYD)
+    if (!ringBuffer) {
+        ringBuffer = (char (*)[TERM_COLS + 1])calloc(RING_SIZE, TERM_COLS + 1);
+        if (!ringBuffer) {
+            tft.fillScreen(TFT_BLACK);
+            tft.setTextColor(0xF800);
+            tft.setCursor(10, 120);
+            tft.print("ALLOC FAILED");
+            delay(2000);
+            return;
+        }
+    }
     ringClear();
 
     // Draw config screen
@@ -600,4 +613,5 @@ void serialMonitorScreen() {
     // -- Cleanup --
     flushLineBuf();
     stopUART();
+    if (ringBuffer) { free(ringBuffer); ringBuffer = nullptr; }
 }
