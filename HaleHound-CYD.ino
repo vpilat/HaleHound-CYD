@@ -1,7 +1,7 @@
 // ═══════════════════════════════════════════════════════════════════════════
 // HaleHound-CYD Main Firmware
 // ESP32 Cheap Yellow Display Edition
-// v3.3.0 — NRF Sniffer, MouseJack, BLE Ducky
+// v3.3.2 — Bug fixes, jammer cleanup, Evil Twin, Valhalla, MouseJack UI
 // Created: 2026-02-06
 // ═══════════════════════════════════════════════════════════════════════════
 //

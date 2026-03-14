@@ -26,7 +26,7 @@
 // FIRMWARE VERSION — single source of truth
 // ═══════════════════════════════════════════════════════════════════════════
 
-#define FW_VERSION "v3.3.0"
+#define FW_VERSION "v3.3.2"
 
 #ifdef CYD_35
   #define FW_EDITION   "CYD 3.5 Edition"
