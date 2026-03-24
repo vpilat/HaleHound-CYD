@@ -293,27 +293,7 @@ void cleanup();
 
 }  // namespace BlePredator
 
-// ═══════════════════════════════════════════════════════════════════════════
-// BLE DUCKY - BLE HID Keyboard Injection
-// ESP32 acts as BLE HID keyboard, injects keystrokes into paired devices
-// Uses T-vK/ESP32-BLE-Keyboard library
-// ═══════════════════════════════════════════════════════════════════════════
-
-namespace BleDucky {
-
-// Initialize BLE HID keyboard and draw UI
-void setup();
-
-// Main loop - pairing status, payload selection, injection
-void loop();
-
-// Check if user requested exit
-bool isExitRequested();
-
-// Cleanup BLE resources
-void cleanup();
-
-}  // namespace BleDucky
+// BLE Ducky removed — see bluetooth_attacks.cpp for rationale
 
 // ═══════════════════════════════════════════════════════════════════════════
 // BLE JAMMER - 2.4GHz BLE Jammer using NRF24L01+PA+LNA

@@ -135,7 +135,7 @@ const unsigned char *wifi_submenu_icons[NUM_SUBMENU_ITEMS] = {
 };
 
 // Bluetooth Submenu - 8 items
-const int bluetooth_NUM_SUBMENU_ITEMS = 8;
+const int bluetooth_NUM_SUBMENU_ITEMS = 7;
 const char *bluetooth_submenu_items[bluetooth_NUM_SUBMENU_ITEMS] = {
     "BLE Jammer",
     "BLE Spoofer",
@@ -143,7 +143,6 @@ const char *bluetooth_submenu_items[bluetooth_NUM_SUBMENU_ITEMS] = {
     "BLE Predator",
     "WhisperPair",
     "Lunatic Fringe",
-    "BLE Ducky",
     "Back to Main Menu"
 };
 
@@ -154,7 +153,6 @@ const unsigned char *bluetooth_submenu_icons[bluetooth_NUM_SUBMENU_ITEMS] = {
     bitmap_icon_analyzer,       // BLE Predator - analyzer icon
     bitmap_icon_eye,
     bitmap_icon_scanner,        // Lunatic Fringe (hub)
-    bitmap_icon_key,            // BLE Ducky - key icon
     bitmap_icon_go_back
 };
 
@@ -1006,22 +1004,6 @@ void handleBluetoothSubmenuTouch() {
                     break;
                 case 5: // Lunatic Fringe (Hub — tracker detect + AirTag tools)
                     handleLunaticFringeHubTouch();
-                    break;
-                case 6: // BLE Ducky
-                    if (!isOffensiveAllowed()) {
-                        if (blue_team_mode) { showBlueTeamBlockedScreen(); if (!showDisclaimerScreen()) break; }
-                        else if (!showDisclaimerScreen()) break;
-                        if (!isOffensiveAllowed()) break;
-                    }
-                    BleDucky::setup();
-                    while (!feature_exit_requested) {
-                        BleDucky::loop();
-                        if (BleDucky::isExitRequested()) feature_exit_requested = true;
-                        touchButtonsUpdate();
-                        if (isBackButtonTapped()) feature_exit_requested = true;
-                        if (IS_BOOT_PRESSED()) feature_exit_requested = true;
-                    }
-                    BleDucky::cleanup();
                     break;
             }
 

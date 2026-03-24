@@ -57,8 +57,14 @@ struct GPSData {
 // INITIALIZATION
 // ═══════════════════════════════════════════════════════════════════════════
 
-// Initialize GPS module - call once at startup
+// Initialize GPS module - call once at startup (draws scanning UI)
 void gpsSetup();
+
+// Headless init — same pin scan as gpsSetup() but draws NOTHING.
+// Caller must call Serial.end() first to free GPIO 3.
+// Returns true if GPS found, false if no module detected.
+// Safe to call if already initialized (returns true immediately).
+bool gpsInitSilent();
 
 // ═══════════════════════════════════════════════════════════════════════════
 // GPS SCREEN FUNCTIONS
@@ -107,6 +113,13 @@ void gpsStartBackground();
 
 // Stop GPS background mode — closes UART2, restores Serial
 void gpsStopBackground();
+
+// ═══════════════════════════════════════════════════════════════════════════
+// HALEHOUND-ALPHA (C5 CO-PROCESSOR) STATUS
+// ═══════════════════════════════════════════════════════════════════════════
+
+// Check if GPS data is coming from C5 co-processor (vs direct NMEA)
+bool gpsIsC5Connected();
 
 // ═══════════════════════════════════════════════════════════════════════════
 // DIAGNOSTICS — TinyGPSPlus counters for debugging data flow

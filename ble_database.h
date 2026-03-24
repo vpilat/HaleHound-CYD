@@ -655,4 +655,129 @@ static const char* lookupCompanyFromMfgData(const uint8_t* mfgData, uint8_t len)
     return lookupCompanyName(id);
 }
 
+// ═══════════════════════════════════════════════════════════════════════════
+// SECTION 4: BLE PREDATOR CLASSIFICATION TABLES
+// ═══════════════════════════════════════════════════════════════════════════
+// Sorted uint16_t arrays for binary search. Used by bpClassifyDevice()
+// to classify BLE devices as RED (high-value target) or SKIP (worthless).
+// ~130 bytes PROGMEM total, zero RAM.
+// ═══════════════════════════════════════════════════════════════════════════
+
+// Device tier for BLE Predator scoring
+enum DeviceTier : uint8_t { TIER_YELLOW = 0, TIER_RED = 1, TIER_SKIP = 2 };
+
+// ── RED lists (high-value targets: locks, car keys, keyboards, IoT gateways) ──
+
+static const uint16_t PROGMEM redServiceUUIDs[] = {
+    0x1812,  // HID (keyboard/mouse)
+    0x1815,  // Automation IO
+    0x181E,  // Bond Management
+    0x1820,  // IP Support / WiFi provisioning
+    0x1827,  // Mesh Provisioning
+    0x1828,  // Mesh Proxy
+};
+static const int RED_SVC_COUNT = sizeof(redServiceUUIDs) / sizeof(redServiceUUIDs[0]);
+
+static const uint16_t PROGMEM redAppearances[] = {
+    0x03C1,  // Keyboard
+    0x03C8,  // Barcode Scanner
+    0x0501,  // Access Point
+    0x0701,  // Access Door
+    0x0704,  // Access Lock
+    0x0708,  // Door Lock
+    0x0709,  // Locker
+    0x0783,  // Smart Plug
+    0x08C1,  // Car
+};
+static const int RED_APP_COUNT = sizeof(redAppearances) / sizeof(redAppearances[0]);
+
+static const uint16_t PROGMEM redCompanyIDs[] = {
+    0x010E,  // Audi
+    0x011F,  // Volkswagen
+    0x017C,  // Mercedes
+    0x01D1,  // August (smart locks)
+    0x01DA,  // Logitech
+    0x022B,  // Tesla
+    0x0526,  // Honeywell
+    0x0723,  // Ford
+    0x07D0,  // Tuya (IoT)
+    0x0977,  // Toyota
+    0x0B53,  // Kaadas (smart locks)
+    0x0BDE,  // Yale (smart locks)
+    0x0EDE,  // Sony Honda Mobility
+};
+static const int RED_CID_COUNT = sizeof(redCompanyIDs) / sizeof(redCompanyIDs[0]);
+
+// ── SKIP lists (worthless: audio, fitness, beacons, gaming) ──
+
+static const uint16_t PROGMEM skipServiceUUIDs[] = {
+    0x180D,  // Heart Rate
+    0x1810,  // Blood Pressure
+    0x1814,  // Running Speed
+    0x1816,  // Cycling Speed
+    0x1818,  // Cycling Power
+    0x1826,  // Fitness Machine
+    0x183E,  // Physical Activity
+    0xFD6F,  // COVID Exposure Notification
+    0xFEAA,  // Eddystone beacon
+};
+static const int SKIP_SVC_COUNT = sizeof(skipServiceUUIDs) / sizeof(skipServiceUUIDs[0]);
+
+static const uint16_t PROGMEM skipAppearances[] = {
+    0x00C1,  // Sports Watch
+    0x0841,  // Speaker
+    0x0842,  // Soundbar
+    0x0941,  // Earbud
+    0x0942,  // Headset
+    0x0943,  // Headphones
+    0x0944,  // Neck Band
+    0x0A81,  // Game Console
+    0x0A82,  // Handheld Game
+};
+static const int SKIP_APP_COUNT = sizeof(skipAppearances) / sizeof(skipAppearances[0]);
+
+static const uint16_t PROGMEM skipCompanyIDs[] = {
+    0x006B,  // Polar
+    0x0087,  // Garmin
+    0x009E,  // Bose
+    0x009F,  // Suunto
+    0x00CC,  // Beats
+    0x00D0,  // Dexcom
+    0x0110,  // Fitbit
+    0x01F9,  // Medtronic
+    0x020E,  // Omron
+    0x02B2,  // Oura
+    0x038D,  // ResMed
+    0x03BB,  // Abbott
+    0x03FF,  // Withings
+    0x0494,  // Sennheiser
+    0x04AD,  // Shure
+    0x0553,  // Nintendo
+    0x055D,  // Valve
+    0x05A7,  // Sonos
+    0x0618,  // Audio-Technica
+    0x067C,  // Tile
+    0x068E,  // Razer
+    0x0768,  // Peloton
+    0x07C9,  // Skullcandy
+    0x08C3,  // Chipolo
+    0x0CE9,  // JLab
+    0x0EDF,  // Dynaudio
+    0x0F7C,  // Polk
+};
+static const int SKIP_CID_COUNT = sizeof(skipCompanyIDs) / sizeof(skipCompanyIDs[0]);
+
+// Binary search helper for sorted PROGMEM uint16_t arrays
+static bool inProgmemU16List(uint16_t val, const uint16_t* list, int count) {
+    int lo = 0, hi = count - 1;
+    while (lo <= hi) {
+        int mid = (lo + hi) / 2;
+        uint16_t midVal = pgm_read_word(&list[mid]);
+        if (midVal == val) return true;
+        else if (midVal < val) lo = mid + 1;
+        else hi = mid - 1;
+    }
+    return false;
+}
+
 #endif // BLE_DATABASE_H

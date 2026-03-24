@@ -11,6 +11,7 @@
 #include "utils.h"
 #include "touch_buttons.h"
 #include "icon.h"
+#include "hlp_protocol.h"
 #include <TinyGPSPlus.h>
 
 #ifndef DEG_TO_RAD
@@ -43,6 +44,20 @@ static uint32_t gpsDollarCount = 0;    // '$' chars seen (NMEA sentence starts)
 static uint32_t gpsPassedCount = 0;    // valid checksum sentences
 static uint32_t gpsSatUpdates = 0;     // how many times gps.satellites.isUpdated() fired
 static int gpsActiveBaud = 9600;        // Which baud rate worked
+
+// ═══════════════════════════════════════════════════════════════════════════
+// C5 CO-PROCESSOR STATE (HaleHound-Alpha link)
+// When c5Connected=true, GPS data arrives as HLP frames at 460800 baud
+// instead of raw NMEA at 9600. All public API remains identical.
+// ═══════════════════════════════════════════════════════════════════════════
+
+bool c5_connected = false;             // Global — other modules can check this
+static bool c5Mode = false;            // Internal — UART2 is in HLP mode
+static HlpParser hlpParser;            // HLP frame parser state machine
+static uint32_t c5FramesReceived = 0;  // Total HLP frames from C5
+static uint32_t c5LastHeartbeat = 0;   // millis() of last heartbeat from C5
+static uint32_t c5CharsReceived = 0;   // C5-reported chars_processed (from HlpGpsData)
+static uint8_t  hlpTxBuf[HLP_FRAME_OVERHEAD + 4];  // Small TX buffer (PING/PONG only)
 
 // ═══════════════════════════════════════════════════════════════════════════
 // ICON BAR
@@ -412,9 +427,9 @@ static void drawGPSScreen() {
     // Diagnostic section labels
     tft.setTextColor(HALEHOUND_GUNMETAL);
     tft.setCursor(SCALE_X(8), SCALE_Y(254));
-    tft.print("NMEA");
+    tft.print(c5Mode ? "HLP" : "NMEA");
     tft.setCursor(SCALE_X(8), SCALE_Y(266));
-    tft.print("PIN");
+    tft.print(c5Mode ? "LINK" : "PIN");
     tft.setCursor(SCALE_X(8), SCALE_Y(278));
     tft.print("AGE");
 }
@@ -518,13 +533,17 @@ static void updateGPSValues() {
     }
 
     // ── Status box (color-coded) ──
-    uint32_t chars = gps.charsProcessed();
+    bool hasData = c5Mode ? (c5FramesReceived > 0) : (gps.charsProcessed() > 0);
 
     tft.fillRoundRect(SCALE_X(6), SCALE_Y(221), SCREEN_WIDTH - SCALE_X(12), SCALE_H(26), 3, HALEHOUND_DARK);
     tft.setTextSize(1);
 
-    if (chars == 0) {
-        drawCenteredText(SCALE_Y(230), "NO DATA - Check wiring", 0xF800, 1);
+    if (!hasData) {
+        if (c5Mode) {
+            drawCenteredText(SCALE_Y(230), "C5 LINKED - Waiting...", HALEHOUND_BRIGHT, 1);
+        } else {
+            drawCenteredText(SCALE_Y(230), "NO DATA - Check wiring", 0xF800, 1);
+        }
     } else if (!currentData.valid) {
         if (currentData.satellites > 0) {
             snprintf(buf, sizeof(buf), "SEARCHING  %d sats", currentData.satellites);
@@ -543,7 +562,6 @@ static void updateGPSValues() {
     }
 
     // ── Pulsing fix skull (inside status box, right side) ──
-    bool hasData = (chars > 0);
     drawSkullIndicator(currentData.valid, hasData);
 
     // ── Diagnostics ──
@@ -554,14 +572,23 @@ static void updateGPSValues() {
     tft.setTextColor(HALEHOUND_GUNMETAL);
     tft.setTextSize(1);
 
-    snprintf(buf, sizeof(buf), "%lu chars  %lu ok  %lu fail",
-             (unsigned long)gps.charsProcessed(),
-             (unsigned long)gps.sentencesWithFix(),
-             (unsigned long)gps.failedChecksum());
+    if (c5Mode) {
+        // C5 mode diagnostics: HLP frame count + C5-reported GPS chars
+        snprintf(buf, sizeof(buf), "HLP %lu frm  GPS %lu ch",
+                 (unsigned long)c5FramesReceived,
+                 (unsigned long)c5CharsReceived);
+    } else {
+        snprintf(buf, sizeof(buf), "%lu chars  %lu ok  %lu fail",
+                 (unsigned long)gps.charsProcessed(),
+                 (unsigned long)gps.sentencesWithFix(),
+                 (unsigned long)gps.failedChecksum());
+    }
     tft.setCursor(SCALE_X(35), SCALE_Y(254));
     tft.print(buf);
 
-    if (gpsActivePin >= 0) {
+    if (c5Mode) {
+        snprintf(buf, sizeof(buf), "C5 ALPHA @ %d", HLP_BAUD);
+    } else if (gpsActivePin >= 0) {
         snprintf(buf, sizeof(buf), "GPIO%d @ %d", gpsActivePin, gpsActiveBaud);
     } else {
         snprintf(buf, sizeof(buf), "---");
@@ -576,6 +603,117 @@ static void updateGPSValues() {
     }
     tft.setCursor(SCALE_X(30), SCALE_Y(278));
     tft.print(buf);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// C5 HLP FRAME HANDLER — Convert HlpGpsData to currentData (GPSData)
+// ═══════════════════════════════════════════════════════════════════════════
+
+static void hlpApplyGpsData(const HlpGpsData* hlp) {
+    // Convert fixed-point wire format back to doubles
+    if (hlp->valid & 0x01) {  // location valid
+        currentData.valid     = true;
+        currentData.latitude  = (double)hlp->lat_e7 / 1e7;
+        currentData.longitude = (double)hlp->lon_e7 / 1e7;
+        lastUpdateTime = millis();
+    }
+
+    if (hlp->valid & 0x02) {  // altitude valid
+        currentData.altitude = (double)hlp->alt_cm / 100.0;
+    }
+
+    currentData.speed      = (double)hlp->speed_dmph / 10.0;
+    currentData.course     = (double)hlp->course_d10 / 10.0;
+    currentData.satellites = hlp->satellites;
+    currentData.hdop       = (double)hlp->hdop_d100 / 100.0;
+    currentData.year       = hlp->year;
+    currentData.month      = hlp->month;
+    currentData.day        = hlp->day;
+    currentData.hour       = hlp->hour;
+    currentData.minute     = hlp->minute;
+    currentData.second     = hlp->second;
+    currentData.age        = hlp->age_ms;
+
+    // Track C5 diagnostics
+    c5CharsReceived = hlp->chars_processed;
+}
+
+// Process one complete HLP frame from C5
+static void hlpProcessFrame(uint8_t type, const uint8_t* payload, uint16_t len) {
+    c5FramesReceived++;
+
+    switch (type) {
+        case HLP_GPS_DATA:
+            if (len >= sizeof(HlpGpsData)) {
+                hlpApplyGpsData((const HlpGpsData*)payload);
+            }
+            break;
+
+        case HLP_HEARTBEAT:
+            c5LastHeartbeat = millis();
+            break;
+
+        case HLP_PONG:
+            // Handled inline during detection — shouldn't arrive here normally
+            break;
+
+        case HLP_VERSION:
+            // Could log capabilities, but Phase 1 doesn't need it
+            break;
+
+        case HLP_GPS_STATUS:
+            // Diagnostic counters — could display if needed
+            break;
+
+        default:
+            break;
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// C5 DETECTION — Send PING at 460800, wait for PONG
+// Returns true if C5 co-processor responds
+// ═══════════════════════════════════════════════════════════════════════════
+
+static bool tryC5Detection() {
+    // Open UART2 at HLP baud rate on P1 pins
+    gpsSerial.end();
+    delay(50);
+    gpsSerial.begin(HLP_BAUD, SERIAL_8N1, GPS_RX_PIN, 1);  // RX=GPIO3, TX=GPIO1
+    delay(50);
+
+    // Drain any garbage
+    while (gpsSerial.available()) gpsSerial.read();
+
+    // Build and send HLP_PING frame
+    uint16_t frameSize = hlpBuildFrame(hlpTxBuf, HLP_PING, nullptr, 0);
+    gpsSerial.write(hlpTxBuf, frameSize);
+    gpsSerial.flush();
+
+    // Wait for HLP_PONG response
+    HlpParser detectParser;
+    detectParser.reset();
+    unsigned long start = millis();
+
+    while (millis() - start < HLP_DETECT_TIMEOUT_MS) {
+        while (gpsSerial.available() > 0) {
+            uint8_t b = gpsSerial.read();
+            if (detectParser.feed(b)) {
+                if (detectParser.type == HLP_PONG) {
+                    return true;
+                }
+                // Got a valid frame but not PONG — could be heartbeat, keep waiting
+                if (detectParser.type == HLP_HEARTBEAT) {
+                    c5LastHeartbeat = millis();
+                    return true;  // Heartbeat also proves C5 is alive
+                }
+                detectParser.reset();
+            }
+        }
+        delay(1);
+    }
+
+    return false;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -618,6 +756,41 @@ void gpsSetup() {
     tft.drawLine(0, SCALE_Y(58), SCREEN_WIDTH, SCALE_Y(58), HALEHOUND_HOTPINK);
 
     drawCenteredText(SCALE_Y(80), "SCANNING GPS...", HALEHOUND_HOTPINK, 2);
+
+    // ── Step 0: Try C5 co-processor first (HLP at 460800 on P1) ──
+    tft.fillRect(0, SCALE_Y(110), SCREEN_WIDTH, SCALE_H(60), TFT_BLACK);
+    tft.setTextSize(1);
+    tft.setTextColor(HALEHOUND_BRIGHT);
+    tft.setCursor(SCALE_X(10), SCALE_Y(115));
+    tft.print("C5 ALPHA @ 460800...");
+
+    if (tryC5Detection()) {
+        // C5 co-processor detected! GPS data arrives via HLP frames.
+        c5Mode = true;
+        c5_connected = true;
+        hlpParser.reset();
+        gpsActivePin = GPS_RX_PIN;
+        gpsActiveBaud = HLP_BAUD;
+
+        tft.setCursor(SCALE_X(10), SCALE_Y(130));
+        tft.setTextColor(0x07E0);
+        tft.print("C5 ALPHA LINKED!");
+
+        tft.fillRect(0, SCALE_Y(170), SCREEN_WIDTH, SCALE_H(40), TFT_BLACK);
+        drawCenteredText(SCALE_Y(180), "ALPHA @ 460800", 0x07E0, 1);
+
+        delay(1500);
+        gpsInitialized = true;
+        return;
+    }
+
+    // C5 not found — fall back to direct NMEA scan (existing behavior)
+    tft.setCursor(SCALE_X(10), SCALE_Y(130));
+    tft.setTextColor(HALEHOUND_GUNMETAL);
+    tft.print("No C5 - direct NMEA scan");
+    c5Mode = false;
+    c5_connected = false;
+    delay(500);
 
     // Pin/baud combos to try — GPIO3 (P1 connector) first
     struct ScanEntry { int pin; int baud; const char* label; };
@@ -685,8 +858,73 @@ void gpsSetup() {
     gpsInitialized = true;
 }
 
+bool gpsInitSilent() {
+    if (gpsInitialized) return true;
+
+    memset(&currentData, 0, sizeof(currentData));
+    currentData.valid = false;
+
+    // Same pin/baud scan as gpsSetup() — just no screen drawing
+    struct ScanEntry { int pin; int baud; };
+    ScanEntry scans[] = {
+        { 3,  9600  },
+        { 3,  38400 },
+        { 26, 9600  },
+        { 26, 38400 },
+        { 1,  9600  },
+    };
+    int numScans = 5;
+
+    gpsActivePin = -1;
+    gpsActiveBaud = 9600;
+
+    for (int i = 0; i < numScans; i++) {
+        uint32_t chars = tryGPSPin(scans[i].pin, scans[i].baud, 2500);
+        if (chars > 10) {
+            gpsActivePin = scans[i].pin;
+            gpsActiveBaud = scans[i].baud;
+            break;
+        }
+    }
+
+    if (gpsActivePin < 0) {
+        // No GPS found — set defaults so UART2 is at least open
+        gpsSerial.end();
+        gpsSerial.begin(GPS_BAUD, SERIAL_8N1, GPS_RX_PIN, -1);
+        gpsActivePin = GPS_RX_PIN;
+        gpsActiveBaud = GPS_BAUD;
+    }
+
+    gpsInitialized = true;
+    return (gpsActivePin >= 0);
+}
+
 void gpsUpdate() {
-    // Read all available GPS data from UART2
+    if (c5Mode) {
+        // ── C5 MODE: Parse HLP frames from co-processor ──
+        while (gpsSerial.available() > 0) {
+            uint8_t b = gpsSerial.read();
+            if (hlpParser.feed(b)) {
+                hlpProcessFrame(hlpParser.type, hlpParser.payload, hlpParser.payloadLen);
+                hlpParser.reset();
+            }
+        }
+
+        // Mark as invalid if no update for GPS_TIMEOUT_MS
+        if (millis() - lastUpdateTime > GPS_TIMEOUT_MS) {
+            currentData.valid = false;
+        }
+
+        // C5 watchdog — if no heartbeat for 10 seconds, C5 may have reset
+        if (c5LastHeartbeat > 0 && (millis() - c5LastHeartbeat > 10000)) {
+            // C5 might have died — data still valid until GPS_TIMEOUT_MS
+            // Don't switch to NMEA mode automatically (would need baud change)
+        }
+
+        return;
+    }
+
+    // ── DIRECT NMEA MODE: Read TinyGPSPlus from UART2 (existing behavior) ──
     while (gpsSerial.available() > 0) {
         char c = gpsSerial.read();
         gps.encode(c);
@@ -779,7 +1017,14 @@ void gpsScreen() {
         // uart_set_pin(), properly reclaiming GPIO 3 from UART0's pin matrix.
         gpsSerial.end();
         delay(100);
-        gpsSerial.begin(gpsActiveBaud, SERIAL_8N1, gpsActivePin, -1);
+        if (c5Mode) {
+            // C5 mode: reopen at HLP baud with TX enabled (bidirectional link)
+            gpsSerial.begin(HLP_BAUD, SERIAL_8N1, GPS_RX_PIN, 1);
+            hlpParser.reset();
+        } else {
+            // Direct NMEA mode: RX only at discovered baud
+            gpsSerial.begin(gpsActiveBaud, SERIAL_8N1, gpsActivePin, -1);
+        }
         delay(100);
     }
 
@@ -804,8 +1049,7 @@ void gpsScreen() {
 
         // Pulsing fix dot — smooth animation at 150ms intervals
         if (millis() - lastPulseUpdate >= 150) {
-            uint32_t chars = gps.charsProcessed();
-            bool hasData = (chars > 0);
+            bool hasData = c5Mode ? (c5FramesReceived > 0) : (gps.charsProcessed() > 0);
             drawSkullIndicator(currentData.valid, hasData);
             lastPulseUpdate = millis();
         }
@@ -826,19 +1070,24 @@ void gpsScreen() {
         delay(10);
     }
 
-    // Close UART2 — do NOT restart Serial (UART0).
-    // GPIO 1 (UART0 TX) is physically wired to the GPS module's RX on P1.
-    // Serial.begin() re-enables UART0 TX on GPIO 1 — txPin=-1 means
-    // "no change" not "disable", so GPIO 1 stays as TX.  Any Serial.println()
-    // then sends 115200-baud garbage to the NEO-6M (9600 baud), which interprets
-    // random bytes as UBX binary commands and cold-restarts — killing satellite
-    // tracking (6→3→0 sats, never recovers).
-    // Fix: end Serial, physically detach GPIO 1 from UART0 via pinMode(OUTPUT),
-    // then drive HIGH (UART idle state).  Serial.println() becomes a no-op.
+    // Close UART2
     gpsSerial.end();
     delay(50);
-    pinMode(1, OUTPUT);
-    digitalWrite(1, HIGH);
+    if (!c5Mode) {
+        // Direct NMEA mode: do NOT restart Serial (UART0).
+        // GPIO 1 (UART0 TX) is physically wired to the GPS module's RX on P1.
+        // Serial.begin() re-enables UART0 TX on GPIO 1 — txPin=-1 means
+        // "no change" not "disable", so GPIO 1 stays as TX.  Any Serial.println()
+        // then sends 115200-baud garbage to the NEO-6M (9600 baud), which interprets
+        // random bytes as UBX binary commands and cold-restarts — killing satellite
+        // tracking (6→3→0 sats, never recovers).
+        // Fix: end Serial, physically detach GPIO 1 from UART0 via pinMode(OUTPUT),
+        // then drive HIGH (UART idle state).  Serial.println() becomes a no-op.
+        pinMode(1, OUTPUT);
+        digitalWrite(1, HIGH);
+    }
+    // In C5 mode, GPIO 1 is the UART2 TX line to C5 — don't touch it.
+    // C5 handles the GPS module directly, no NEO-6M on GPIO 1 to worry about.
 }
 
 bool gpsHasFix() {
@@ -872,6 +1121,14 @@ bool gpsIsFresh() {
 }
 
 GPSStatus gpsGetStatus() {
+    if (c5Mode) {
+        // C5 mode: use currentData directly (populated from HLP frames)
+        if (c5FramesReceived == 0) return GPS_NO_MODULE;
+        if (!currentData.valid)    return GPS_SEARCHING;
+        if (currentData.altitude != 0.0) return GPS_FIX_3D;
+        return GPS_FIX_2D;
+    }
+    // Direct NMEA mode
     if (!gpsInitialized || gps.charsProcessed() < 10) {
         return GPS_NO_MODULE;
     }
@@ -897,12 +1154,6 @@ void gpsStartBackground() {
     // Kill UART0 (Serial) to free GPIO 3 for GPS UART2
     Serial.end();
     delay(10);
-    // Physically detach GPIO 1 from UART0 TX and drive HIGH (UART idle).
-    // GPIO 1 is wired to GPS module's RX on P1. pinMode(OUTPUT) disconnects
-    // the IOMUX routing that Serial.begin() set up, so even if Serial gets
-    // re-initialized elsewhere, GPIO 1 won't carry UART0 TX data.
-    pinMode(1, OUTPUT);
-    digitalWrite(1, HIGH);
 
     // Force UART2 hard reset — previous screen closed UART2 and opened UART0
     // on the same GPIO 3. The pin matrix may still have UART0's IOMUX routing
@@ -912,6 +1163,39 @@ void gpsStartBackground() {
     // might take the "already initialized" shortcut and skip pin reconfiguration.
     gpsSerial.end();
     delay(100);
+
+    if (c5Mode) {
+        // C5 already detected — reopen HLP link at 460800 with TX
+        gpsSerial.begin(HLP_BAUD, SERIAL_8N1, GPS_RX_PIN, 1);
+        hlpParser.reset();
+        delay(100);
+        while (gpsSerial.available()) gpsSerial.read();
+        return;
+    }
+
+    // Not in C5 mode yet — try C5 detection if not previously scanned
+    if (!gpsInitialized) {
+        if (tryC5Detection()) {
+            c5Mode = true;
+            c5_connected = true;
+            hlpParser.reset();
+            gpsActivePin = GPS_RX_PIN;
+            gpsActiveBaud = HLP_BAUD;
+            gpsInitialized = true;
+            delay(100);
+            while (gpsSerial.available()) gpsSerial.read();
+            return;
+        }
+        // C5 not found — fall through to direct NMEA
+    }
+
+    // Physically detach GPIO 1 from UART0 TX and drive HIGH (UART idle).
+    // GPIO 1 is wired to GPS module's RX on P1. pinMode(OUTPUT) disconnects
+    // the IOMUX routing that Serial.begin() set up, so even if Serial gets
+    // re-initialized elsewhere, GPIO 1 won't carry UART0 TX data.
+    // NOTE: Only needed in direct NMEA mode. In C5 mode, GPIO 1 is UART2 TX.
+    pinMode(1, OUTPUT);
+    digitalWrite(1, HIGH);
 
     if (gpsInitialized && gpsActivePin >= 0) {
         // GPS was scanned before — reopen UART2 on the known working pin
@@ -934,19 +1218,32 @@ void gpsStartBackground() {
 void gpsStopBackground() {
     gpsSerial.end();
     delay(50);
-    // Do NOT restart Serial — GPIO 1 (UART0 TX) is wired to GPS module's RX.
-    // Serial.begin() with txPin=-1 means "no change" — GPIO 1 stays as UART0 TX.
-    // Any Serial.println() then sends 115200-baud garbage to the NEO-6M.
-    // Instead: detach GPIO 1 from UART0 and hold HIGH (UART idle state).
-    pinMode(1, OUTPUT);
-    digitalWrite(1, HIGH);
+    if (!c5Mode) {
+        // Do NOT restart Serial — GPIO 1 (UART0 TX) is wired to GPS module's RX.
+        // Serial.begin() with txPin=-1 means "no change" — GPIO 1 stays as UART0 TX.
+        // Any Serial.println() then sends 115200-baud garbage to the NEO-6M.
+        // Instead: detach GPIO 1 from UART0 and hold HIGH (UART idle state).
+        // NOTE: In C5 mode, GPIO 1 is UART2 TX to C5 — don't mess with it.
+        pinMode(1, OUTPUT);
+        digitalWrite(1, HIGH);
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// C5 CO-PROCESSOR STATUS
+// ═══════════════════════════════════════════════════════════════════════════
+
+bool gpsIsC5Connected() {
+    return c5Mode;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
 // DIAGNOSTICS — expose TinyGPSPlus counters for wardriving debug
+// In C5 mode, returns C5-reported values where applicable
 // ═══════════════════════════════════════════════════════════════════════════
 
 uint32_t gpsCharsProcessed() {
+    if (c5Mode) return c5CharsReceived;
     return (uint32_t)gps.charsProcessed();
 }
 

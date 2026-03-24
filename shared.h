@@ -83,6 +83,9 @@ extern bool blue_team_mode;         // VALHALLA blue team mode active (persisted
 // CC1101 PA MODULE STATE
 extern bool cc1101_pa_module;       // E07-433M20S PA module active (persisted in EEPROM)
 
+// HALEHOUND-ALPHA (C5 CO-PROCESSOR) STATE
+extern bool c5_connected;           // C5 co-processor detected on P1 UART
+
 // ═══════════════════════════════════════════════════════════════════════════
 // FUNCTION DECLARATIONS
 // ═══════════════════════════════════════════════════════════════════════════

