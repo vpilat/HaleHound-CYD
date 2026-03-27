@@ -44,15 +44,15 @@
 
 **ESP32-DIV HaleHound Edition for Cheap Yellow Display**
 
-Version **v3.4.0 CYD Edition** | By [JesseCHale](https://github.com/JesseCHale) | [HaleHound.com](https://halehound.com)
+Version **v3.5.0 CYD Edition** | By [JesseCHale](https://github.com/JesseCHale) | [HaleHound.com](https://halehound.com)
 
 ---
 
 ## Overview
 
-HaleHound-CYD is a multi-protocol offensive security toolkit built for the ESP32 "Cheap Yellow Display" (CYD) platform. Supports the 2.8" (ESP32-2432S028), QDtech E32R28T (2.8"), and QDtech E32R35T (3.5") boards. External CC1101 SubGHz, NRF24L01+PA+LNA 2.4GHz, PN532 NFC/RFID, and GPS modules connect via the CYD's breakout pins.
+HaleHound-CYD is a multi-protocol offensive security toolkit built for the ESP32 "Cheap Yellow Display" (CYD) platform. Supports the 2.8" (ESP32-2432S028), QDtech E32R28T (2.8"), QDtech E32R35T (3.5"), and ESP32-3248S035C (3.5" capacitive touch) boards. External CC1101 SubGHz, NRF24L01+PA+LNA 2.4GHz, PN532 NFC/RFID, and GPS modules connect via the CYD's breakout pins.
 
-Every attack module from the original ESP32-DIV is present, plus CYD-exclusive features: full touchscreen navigation, EAPOL/PMKID capture, Karma attacks, wardriving with GPS logging, PN532 RFID card scanning/cloning/brute force, defensive jam detection, NRF24 promiscuous sniffer with MouseJack keystroke injection, AirTag attack suite (Phantom Flood, AirTag Replay, Find You), BLE HID keyboard injection (BLE Ducky), UART serial monitor for hardware hacking, and OTA firmware updates from SD card.
+Every attack module from the original ESP32-DIV is present, plus CYD-exclusive features: full touchscreen navigation, EAPOL/PMKID capture, Karma attacks, wardriving with GPS logging, PN532 RFID card scanning/cloning/brute force, defensive jam detection, NRF24 promiscuous sniffer with MouseJack keystroke injection, AirTag attack suite (Phantom Flood, AirTag Replay), BLE Predator GATT reconnaissance and honeypot credential trap, Flock Safety surveillance camera detection, UART serial monitor for hardware hacking, and OTA firmware updates from SD card.
 
 All radios transmit at maximum power. No safety nets.
 
@@ -124,7 +124,8 @@ All radios transmit at maximum power. No safety nets.
 |-------|-------------|---------|-------|--------|
 | ESP32-2432S028 (2.8") | `esp32-cyd` | 240x320 ILI9341 | XPT2046 Resistive | **Fully Tested** |
 | QDtech E32R35T (3.5") | `esp32-e32r35t` | 320x480 ST7796 | XPT2046 Resistive | **Fully Tested** |
-| QDtech E32R28T (2.8") | `esp32-e32r28t` | 240x320 ILI9341 | XPT2046 Resistive | Supported |
+| ESP32-3248S035C (3.5") | `esp32-cyd35c` | 320x480 ST7796 | GT911 Capacitive (I2C) | **Fully Tested** |
+| QDtech/Hosyond E32R28T (2.8") | `esp32-e32r28t` | 240x320 ILI9341 | XPT2046 Resistive | **Fully Tested** |
 | NM-RF-Hat (2.8") | `esp32-cyd-hat` | 240x320 ILI9341 | XPT2046 Resistive | Supported |
 
 Board selection is automatic via PlatformIO build target. Build with:
@@ -301,7 +302,7 @@ The MicroSD slot is **built into the CYD board** on the back. No external wiring
 ## Menu Tree
 
 ```
-HALEHOUND-CYD v3.4.0
+HALEHOUND-CYD v3.5.0
 │
 ├── WiFi ──────────────────────────────────────────────────
 │   ├── Packet Monitor ......... Real-time 802.11 frame capture
@@ -318,16 +319,13 @@ HALEHOUND-CYD v3.4.0
 │   ├── BLE Jammer ............. 2.4GHz BLE channel flood (NRF24)
 │   ├── BLE Spoofer ............ Multi-platform BLE spam engine
 │   ├── BLE Beacon ............. iBeacon / Eddystone transmitter
-│   ├── Sniffer ................ Passive BLE advertisement monitor
-│   ├── BLE Scanner ............ Discover nearby BLE devices
+│   ├── BLE Predator ........... GATT recon + honeypot credential trap
 │   ├── WhisperPair ............ CVE-2025-36911 Fast Pair exploit
-│   ├── AirTag Hub ─────────── Apple FindMy attack suite
+│   ├── Lunatic Fringe ─────── Tracker & surveillance detection
+│   │   ├── Tracker Scan ....... Multi-platform BLE tracker scanner
 │   │   ├── AirTag Detect ...... FindMy tracker detection
 │   │   ├── Phantom Flood ...... FindMy OF advertisement flood
-│   │   ├── AirTag Replay ...... Sniff & replay AirTag identity
-│   │   └── Find You ........... Stealth AirTag clone (P-224 keys)
-│   ├── Lunatic Fringe ......... Multi-platform tracker scanner
-│   ├── BLE Ducky .............. BLE HID keyboard injection
+│   │   └── AirTag Replay ...... Sniff & replay AirTag identity
 │   └── Back to Main Menu
 │
 ├── 2.4GHz (NRF24) ───────────────────────────────────────
@@ -366,6 +364,9 @@ HALEHOUND-CYD v3.4.0
 │   ├── Karma Attack ........... Auto-respond to probe requests
 │   ├── Wardriving ............. GPS-tagged AP scanning
 │   ├── Saved Captures ......... Browse captured handshakes
+│   ├── IoT Recon .............. Network device reconnaissance
+│   ├── Loot ................... Browse captured loot files
+│   ├── Flock You .............. Flock Safety surveillance detector
 │   └── Back to Main Menu
 │
 ├── Tools ─────────────────────────────────────────────────
@@ -527,7 +528,7 @@ Overwhelms a target AP's client table by flooding it with 802.11 authentication 
 
 ### Bluetooth Attacks
 
-All BLE attacks use the ESP32's built-in Bluetooth radio. Includes AirTag attack modules (Phantom Flood, AirTag Replay, Find You) and BLE HID keyboard injection (BLE Ducky). Proper radio teardown between WiFi and BLE modes is handled automatically.
+All BLE attacks use the ESP32's built-in Bluetooth radio. Includes BLE Predator (GATT recon + honeypot), AirTag attack modules (Phantom Flood, AirTag Replay), and the Lunatic Fringe tracker detection hub. Proper radio teardown between WiFi and BLE modes is handled automatically.
 
 #### BLE Jammer
 
@@ -541,13 +542,28 @@ Clones the identity of a nearby BLE device. Scan first, select a target, then th
 
 Broadcasts custom BLE beacon advertisements. Can impersonate AirTags, Tiles, or custom iBeacon/Eddystone payloads.
 
-#### BLE Sniffer
+#### BLE Predator — GATT Reconnaissance + Honeypot Credential Trap
 
-Passive BLE traffic analyzer. Displays advertisement data, RSSI, device names, and manufacturer data in real time.
+Three-phase BLE attack module. SCAN phase discovers nearby BLE devices with threat-tier classification (RED/YELLOW) based on appearance, company ID, and signal strength. RECON phase connects to the selected target via GATT client, enumerates all services and characteristics, and caches read values. HONEYPOT phase builds a raw ESP-IDF GATTS server clone with matching UUIDs and properties, broadcasts connectable advertisements with the cloned MAC address, and logs every CONNECT/READ/WRITE/DISCONNECT event. WRITE events capture credential data (PINs, tokens, passwords). Loot saved to SD card.
 
-#### BLE Scanner
+```
+┌──────────────────────────────────────────────┐
+│  ATTACK FLOW                                 │
+│                                              │
+│  1. BLE scan — discover nearby devices       │
+│  2. Classify by threat tier (RED/YELLOW)     │
+│  3. Select target from device list           │
+│  4. RECON: GATT client connect + enumerate   │
+│  5. Cache all service/char UUIDs + values    │
+│  6. HONEYPOT: Clone as GATTS server          │
+│  7. Broadcast connectable ADV (cloned MAC)   │
+│  8. Log all CONNECT/READ/WRITE/DISCONNECT    │
+│  9. WRITE captures → credential harvest      │
+│  10. Save loot to SD: /loot/ble_hp_*.txt     │
+└──────────────────────────────────────────────┘
+```
 
-Discovery tool that lists all nearby BLE devices with their names, MAC addresses, RSSI, and advertised services.
+Features: 3-mode on-screen keyboard for device name filtering, pulsing LIVE indicator during honeypot operation, color-coded event log, SD card loot save with timestamps.
 
 #### WhisperPair — CVE-2025-36911 Fast Pair Vulnerability Scanner
 
@@ -653,42 +669,6 @@ Captures real AirTag and FindMy BLE advertisements (MAC address + full 31-byte p
 └──────────────────────────────────────────────┘
 ```
 
-#### Find You — Stealth AirTag Clone
-
-Stealth AirTag clone using pre-generated P-224 elliptic curve keypairs. Keys rotate every 15-120 seconds, staying below Apple's anti-stalking detection window. The owner retrieves GPS locations via macless-haystack against Apple's FindMy network.
-
-```
-┌──────────────────────────────────────────────┐
-│  ATTACK FLOW                                 │
-│                                              │
-│  1. Load pre-generated P-224 EC keypairs     │
-│  2. Build FindMy advertisement with key      │
-│  3. Broadcast via BLE advertising            │
-│  4. Rotate to next key every 15-120s         │
-│  5. Below Apple anti-stalking threshold      │
-│  6. Nearby iPhones relay location to Apple   │
-│  7. Owner retrieves via macless-haystack     │
-└──────────────────────────────────────────────┘
-```
-
-#### BLE Ducky — BLE HID Keyboard Injection
-
-ESP32 acts as a BLE HID keyboard using the ESP32-BLE-Keyboard library. Target device pairs with "HaleHound KB", then the ESP32 injects keystroke payloads. Pre-built payloads include reverse shell (PowerShell/bash), Rick Roll, and custom string entry.
-
-```
-┌──────────────────────────────────────────────┐
-│  ATTACK FLOW                                 │
-│                                              │
-│  1. Init BLE HID keyboard (ESP32-BLE-KB)     │
-│  2. Advertise as "HaleHound KB"              │
-│  3. Wait for target to pair                  │
-│  4. User selects payload from menu           │
-│  5. Inject keystrokes at 50ms timing         │
-│  6. Progress bar shows injection status      │
-│  7. Requires target to accept BLE pairing    │
-└──────────────────────────────────────────────┘
-```
-
 ---
 
 ### 2.4GHz NRF24 Attacks
@@ -701,7 +681,7 @@ Scans all 126 NRF24 channels (2400-2525 MHz) and displays active channel activit
 
 #### Spectrum Analyzer
 
-Real-time visual spectrum display of the 2.4GHz band using the NRF24 as a wideband receiver. Shows signal strength across all channels with a waterfall display.
+Real-time visual spectrum display of the 2.4GHz band using the NRF24 as a wideband receiver. Shows signal strength across all channels with a waterfall display. Supports AP-Locked mode — tap the AP Select icon to run a WiFi scan, pick an access point, and the analyzer locks to that WiFi channel's NRF24 range (~22 channels) with zoomed view and the SSID in the title bar.
 
 #### WLAN Jammer
 
@@ -888,6 +868,25 @@ GPS-tagged WiFi scanning. Scans for access points while recording GPS coordinate
 
 Browse and manage previously captured EAPOL handshakes and PMKID hashes stored on the SD card.
 
+#### Flock You — Flock Safety Surveillance Camera Detector
+
+Passive SIGINT module that detects Flock Safety ALPR (Automatic License Plate Reader) cameras, Raven/ShotSpotter gunshot detection sensors, and associated infrastructure via BLE advertisement fingerprinting. Identifies devices using 22 OUI prefixes (BLE battery beacons, WiFi APs, direct IEEE registrations, SoundThinking), 4 BLE name patterns, XUNTONG manufacturer ID (0x09C8), and 8 Raven GATT service UUIDs spanning firmware versions v1.1.x through v1.3.x. Estimates firmware version from service UUID presence. Dual-core operation: BLE scan task on Core 0, UI/touch on Core 1. SD card save with GPS coordinates to `/loot/flock_*.txt`.
+
+```
+┌──────────────────────────────────────────────┐
+│  DETECTION METHOD                            │
+│                                              │
+│  1. BLE scan for Flock/Raven advertisements  │
+│  2. Match 22 OUI prefixes across 3 sources  │
+│  3. Match 4 BLE name patterns               │
+│  4. Match XUNTONG manufacturer ID (0x09C8)  │
+│  5. Probe 8 Raven GATT service UUIDs        │
+│  6. Estimate firmware version from UUIDs    │
+│  7. Display: type, MAC, RSSI, FW version    │
+│  8. Save to SD with GPS coordinates         │
+└──────────────────────────────────────────────┘
+```
+
 ---
 
 ### Tools
@@ -918,7 +917,9 @@ Live GPS satellite view with NMEA data parsing via TinyGPSPlus. Displays satelli
 
 #### Radio Test
 
-Interactive SPI hardware verification tool for NRF24L01+ and CC1101 radios. Tests SPI communication by reading chip identification registers (NRF24 CONFIG register 0x08, CC1101 VERSION register 0x14) and provides smart failure diagnostics — distinguishes between wiring issues, dead chips, and clone chip detection. Includes battery voltage readout and 4-page wiring block diagrams with KiCad-style layout showing colored trace lines, solder dots, and chip boxes for NRF24, GPS, and CC1101 connections.
+Comprehensive radio hardware verification and diagnostic tool. NRF24 test runs a 126-channel spectrum scan (30 sweeps via testRPD()) plus TX verification. CC1101 test measures RSSI baseline on 315/433.92 MHz with 3-second signal detection. GPS test runs inline with a gradient progress bar. SPI communication verified by reading chip identification registers (NRF24 CONFIG register 0x08, CC1101 VERSION register 0x14) with smart failure diagnostics — distinguishes between wiring issues, dead chips, and clone chip detection. Includes battery voltage readout and 4-page wiring block diagrams with KiCad-style layout showing colored trace lines, solder dots, and chip boxes for NRF24, GPS, and CC1101 connections.
+
+*Radio Test upgrade — spectrum scan, TX test, and signal detection source code by Duggie*
 
 ---
 
@@ -1013,7 +1014,7 @@ Every attack radio is configured for maximum transmission power.
 | CC1101 Brute Force | `setPA(12)` | +12 dBm | Yes |
 | BLE (all modes) | `ESP_PWR_LVL_P9` | +9 dBm | Yes |
 
-Passive-only modules (Packet Monitor, Probe Sniffer, Station Scanner, BLE Scanner) do not set TX power as they only receive.
+Passive-only modules (Packet Monitor, Probe Sniffer, Station Scanner, BLE Predator scan phase) do not set TX power as they only receive.
 
 ---
 
@@ -1276,9 +1277,9 @@ HaleHound-CYD/
 │
 ├── wifi_attacks.cpp/h ......... Packet Mon, Beacon, Deauth, Probe,
 │                                WiFi Scan, Captive Portal, Station Scan
-├── bluetooth_attacks.cpp/h .... BLE Jammer, Spoofer, Beacon, Sniffer, Scanner,
-│                                WhisperPair, AirTag Hub, Phantom Flood, AirTag
-│                                Replay, Find You, BLE Ducky
+├── bluetooth_attacks.cpp/h .... BLE Jammer, Spoofer, Beacon, BLE Predator,
+│                                WhisperPair, Lunatic Fringe Hub, Phantom Flood,
+│                                AirTag Replay, Flock You
 ├── nrf24_attacks.cpp/h ........ Scanner, Analyzer, NRF Sniffer, MouseJack,
 │                                WLAN Jammer, Proto Kill
 ├── nrf24_config.cpp/h ......... NRF24 initialization and SPI setup
@@ -1304,6 +1305,8 @@ HaleHound-CYD/
 ├── CYD28_TouchscreenR.cpp/h ... Custom XPT2046 driver (polling mode)
 ├── spi_manager.cpp/h .......... VSPI bus arbitration
 ├── utils.cpp/h ................ Glitch text, centered text, helpers
+│
+├── ble_database.h ............. BLE company IDs, service UUIDs, GAP appearances
 │
 ├── icon.h ..................... Menu and module icon bitmaps
 ├── skull_bg.h ................. Skull watermark background bitmap
@@ -1332,8 +1335,8 @@ Managed by PlatformIO (`lib_deps` in `platformio.ini`):
 | RF24 | ^1.4.9 | NRF24L01 driver |
 | XPT2046_Touchscreen | git | Touch controller driver |
 | SmartRC-CC1101-Driver-Lib | ^2.5.7 | CC1101 radio driver |
-| ESP32 BLE Keyboard | ^0.3.2 | BLE HID keyboard for BLE Ducky |
 | Adafruit PN532 | ^1.3.3 | PN532 NFC/RFID module driver |
+| TAMC_GT911 | local | GT911 capacitive touch driver (CYD35C) |
 
 ---
 
@@ -1341,13 +1344,13 @@ Managed by PlatformIO (`lib_deps` in `platformio.ini`):
 
 **HaleHound-CYD** by [JesseCHale](https://github.com/JesseCHale)
 
-Based on the ESP32-DIV project. HaleHound-CYD is a ground-up rewrite with 30+ attack modules, hardware pin corrections (CC1101 TX/RX swap fix), full touchscreen support, SIGINT suite, NRF24 promiscuous sniffer, MouseJack keystroke injection, AirTag attack suite, BLE HID injection, PN532 RFID/NFC, jam detection, and the CYD hardware port.
+Based on the ESP32-DIV project. HaleHound-CYD is a ground-up rewrite with 30+ attack modules, hardware pin corrections (CC1101 TX/RX swap fix), full touchscreen support (resistive + capacitive), SIGINT suite, NRF24 promiscuous sniffer, MouseJack keystroke injection, AirTag attack suite, BLE Predator GATT honeypot, Flock Safety surveillance detection, PN532 RFID/NFC, jam detection, and the CYD hardware port.
 
 GitHub: [github.com/JesseCHale/HaleHound-CYD](https://github.com/JesseCHale/HaleHound-CYD)
 
 ### Community Contributors
 
-**Duggie** — Lunatic Fringe concept, EAPOL back button bug report
+**Duggie** — Lunatic Fringe concept, Radio Test upgrade source code (spectrum scan, TX test, signal detection), EAPOL back button bug report
 
 ---
 

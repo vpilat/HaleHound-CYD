@@ -1,7 +1,7 @@
 // ═══════════════════════════════════════════════════════════════════════════
 // HaleHound-CYD Main Firmware
 // ESP32 Cheap Yellow Display Edition
-// v3.4.0 — Replace CYD 3.5" with E32R35T, fix touch, scale GPS for 320x480
+// v3.5.0 — BLE Predator, Flock You, CYD35C cap touch, Radio Test overhaul
 // Created: 2026-02-06
 // ═══════════════════════════════════════════════════════════════════════════
 //

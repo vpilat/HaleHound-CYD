@@ -45,7 +45,7 @@
 // FIRMWARE VERSION — single source of truth
 // ═══════════════════════════════════════════════════════════════════════════
 
-#define FW_VERSION "v3.4.0"
+#define FW_VERSION "v3.5.0"
 
 #ifdef CYD_3248S035C
   #define FW_EDITION   "CYD35C Edition"
