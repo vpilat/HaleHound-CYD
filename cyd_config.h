@@ -45,7 +45,7 @@
 // FIRMWARE VERSION — single source of truth
 // ═══════════════════════════════════════════════════════════════════════════
 
-#define FW_VERSION "v3.5.0"
+#define FW_VERSION "v3.5.1"
 
 #ifdef CYD_3248S035C
   #define FW_EDITION   "CYD35C Edition"
@@ -230,6 +230,28 @@
 // │ RX_EN ──────┼──────┤ GPIO 0      │ (BOOT pad) PA receive
 // └─────────────┘      └─────────────┘
 //
+// WIRING DIAGRAM (3248S035C — E07-433M20S PA Module):
+// ┌─────────────┐      ┌─────────────┐
+// │ E07-433M20S │      │  3248S035C  │
+// │  CC1101+PA  │      │   ESP32     │
+// ├─────────────┤      ├─────────────┤
+// │ VCC ────────┼──────┤ 3.3V        │
+// │ GND ────────┼──────┤ GND         │
+// │ SCK ────────┼──────┤ GPIO 18     │ (4P SPI connector)
+// │ MOSI ───────┼──────┤ GPIO 23     │ (4P SPI connector)
+// │ MISO ───────┼──────┤ GPIO 19     │ (4P SPI connector)
+// │ CS ─────────┼──────┤ GPIO 26     │ (Speaker/DAC pad — speaker disabled)
+// │ GDO0 ───────┼──────┤ GPIO 22     │ (P3 connector) TX to radio
+// │ GDO2 ───────┼──────┤ GPIO 35     │ (P3 connector) RX from radio
+// │ TX_EN ──────┼──────┤ GPIO 4      │ (Amp enable pad) PA transmit
+// │ RX_EN ──────┼──────┤ GPIO 0      │ (BOOT pad) PA receive
+// └─────────────┘      └─────────────┘
+//
+// NOTE: 3248S035C CC1101_CS is GPIO 26 (NOT GPIO 21 like E32R35T).
+// GPIO 27 = backlight on 3.5". GPIO 21 = GT911 INT trace (R25 not populated).
+// GPIO 26 = speaker/DAC pad — speaker disabled, sacrificed for SubGHz radio.
+// See: https://github.com/JesseCHale/HaleHound-CYD/issues/5
+//
 // IMPORTANT: GDO0/GDO2 naming is confusing!
 // - GDO0 (GPIO22) = Data going TO the CC1101 (for TX)
 // - GDO2 (GPIO35) = Data coming FROM the CC1101 (for RX)
@@ -237,7 +259,9 @@
 //
 // ═══════════════════════════════════════════════════════════════════════════
 
-#ifdef CYD_35
+#ifdef CYD_3248S035C
+  #define CC1101_CS     26    // Chip Select - speaker/DAC pad (speaker disabled for SubGHz)
+#elif defined(CYD_35)
   #define CC1101_CS     21    // Chip Select - SPI peripheral connector (E32R35T)
 #else
   #define CC1101_CS     27    // Chip Select - CN1 connector
@@ -334,6 +358,24 @@
 // │ IRQ ────────┼──────┤ N/C         │ (GPIO 17 used for PN532)
 // └─────────────┘      └─────────────┘
 //
+// WIRING DIAGRAM (3248S035C — E01-2G4M27SX):
+// ┌─────────────┐      ┌─────────────┐
+// │ E01-2G4M27  │      │  3248S035C  │
+// │    SX       │      │   ESP32     │
+// ├─────────────┤      ├─────────────┤
+// │ VCC ────────┼──────┤ 3.3V        │ (add 47uF cap if unstable!)
+// │ GND ────────┼──────┤ GND         │
+// │ SCK ────────┼──────┤ GPIO 18     │ (shared VSPI)
+// │ MOSI ───────┼──────┤ GPIO 23     │ (shared VSPI)
+// │ MISO ───────┼──────┤ GPIO 19     │ (shared VSPI)
+// │ CSN ────────┼──────┤ GPIO 21     │ (P3 connector — GT911 INT R25 not populated)
+// │ CE ─────────┼──────┤ GPIO 16     │ (RGB Green pad)
+// │ IRQ ────────┼──────┤ N/C         │ (GPIO 17 used for PN532)
+// └─────────────┘      └─────────────┘
+//
+// NOTE: 3248S035C pins SWAP vs E32R35T — CC1101_CS=26, NRF24_CSN=21
+// (E32R35T has CC1101_CS=21, NRF24_CSN=26)
+//
 // NOTE: The +PA+LNA version needs clean 3.3V power!
 // Add a 47uF capacitor between VCC and GND at the module if you get
 // communication errors or the module resets randomly.
@@ -348,6 +390,13 @@
   // E32R28T/E32R35T: GPIO 4 used for CC1101_TX_EN (amp enable), NRF24_CSN moves to GPIO 26
   // GPIO 26 = DAC pad — coupling cap to SC8002B amp input (amp shut down = tiny load)
   #define NRF24_CSN     26    // Chip Select - DAC/speaker pad (amp dead)
+  #define NRF24_CE      16    // Chip Enable - RGB Green pad
+  #define NRF24_IRQ     17    // Interrupt - RGB Blue pad (shared with PN532_CS)
+#elif defined(CYD_3248S035C)
+  // 3248S035C: CC1101_CS on GPIO 26 (speaker pad), so NRF24_CSN swaps to GPIO 21
+  // GPIO 21 = GT911 INT trace exists but R25 NOT POPULATED = pin electrically free
+  // Cannot use GPIO 4 (CC1101_TX_EN) or GPIO 26 (CC1101_CS) — both taken
+  #define NRF24_CSN     21    // Chip Select - P3 connector (GT911 INT R25 not populated)
   #define NRF24_CE      16    // Chip Enable - RGB Green pad
   #define NRF24_IRQ     17    // Interrupt - RGB Blue pad (shared with PN532_CS)
 #else
@@ -441,7 +490,7 @@
 #define UART_MON_P1_RX        3    // P1 RX pin (shared with USB Serial RX)
 #define UART_MON_P1_TX        1    // P1 TX pin (shared with USB Serial TX)
 #ifdef CYD_35
-  #define UART_MON_SPK_RX    -1    // GPIO 26 is NRF24_CSN on E32R35T — no speaker RX
+  #define UART_MON_SPK_RX    -1    // GPIO 26 is NRF24_CSN (E32R35T) or CC1101_CS (3248S035C)
 #elif defined(CYD_E32R28T)
   #define UART_MON_SPK_RX    -1    // GPIO 26 is NRF24_CSN on E32R28T — no speaker RX
 #else
@@ -574,8 +623,10 @@
 //   │ SD Card  │ GPIO 5                    │ Built-in slot, payload storage│
 //   │ CC1101   │ GPIO 27 (28"/E32R28T)     │ SubGHz radio                  │
 //   │          │ GPIO 21 (E32R35T)         │ (27 = backlight on 3.5")      │
+//   │          │ GPIO 26 (3248S035C)       │ (speaker disabled for SubGHz) │
 //   │ NRF24    │ GPIO 4  (28")             │ 2.4GHz radio                  │
 //   │          │ GPIO 26 (E32R28T/E32R35T) │ (4 = amp enable)              │
+//   │          │ GPIO 21 (3248S035C)       │ (GT911 INT R25 not populated) │
 //   │ PN532    │ GPIO 17                   │ NFC/RFID 13.56 MHz (LSBFIRST)│
 //   └──────────┴───────────────────────────┴───────────────────────────────┘
 //

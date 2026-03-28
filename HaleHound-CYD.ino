@@ -1,7 +1,7 @@
 // ═══════════════════════════════════════════════════════════════════════════
 // HaleHound-CYD Main Firmware
 // ESP32 Cheap Yellow Display Edition
-// v3.5.0 — BLE Predator, Flock You, CYD35C cap touch, Radio Test overhaul
+// v3.5.1 — Fix CYD35C pin mapping: CC1101_CS=26, NRF24_CSN=21 (issue #5)
 // Created: 2026-02-06
 // ═══════════════════════════════════════════════════════════════════════════
 //
