@@ -47,28 +47,98 @@
 ================================================================================
 
 
-                              MIT LICENSE
+================================================================================
+                     HALEHOUND-CYD PROPRIETARY LICENSE
+================================================================================
 
-Copyright (c) 2026 Jesse C. Hale (HaleHound-CYD Edition)
-Copyright (c) 2023 CiferTech (original ESP32-DIV)
+Copyright (c) 2026 Jesse C. Hale. All rights reserved.
 
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files (the "Software"), to deal
-in the Software without restriction, including without limitation the rights
-to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-copies of the Software, and to permit persons to whom the Software is
-furnished to do so, subject to the following conditions:
+GRANT OF USE:
+Permission is hereby granted, free of charge, to any person obtaining a
+copy of this firmware ("the Firmware"), to use the Firmware for personal,
+educational, and authorized security testing purposes, subject to the
+following conditions:
 
-The above copyright notice and this permission notice shall be included in all
-copies or substantial portions of the Software.
+PERMITTED:
+  - Flashing and running the firmware on compatible hardware you own
+  - Using the firmware for authorized penetration testing and security
+    research on systems you own or have explicit written permission to test
+  - Sharing a link to this repository so others can obtain the firmware
+    from the official source
 
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-SOFTWARE.
+PROHIBITED:
+  - Redistributing the firmware binaries, in whole or in part, through
+    any channel other than this repository
+  - Reverse engineering, decompiling, or disassembling the firmware
+  - Modifying, adapting, or creating derivative works from the binaries
+  - Selling, sublicensing, or commercially distributing the firmware
+  - Hosting mirrors or alternative download locations for the binaries
+  - Removing or altering any branding, attribution, or license notices
+  - Claiming authorship of the firmware or any portion thereof
+
+SOURCE CODE:
+The source code for HaleHound-CYD is proprietary and not publicly
+available. The compiled firmware binaries in this repository are provided
+for end-user use only under the terms of this license.
+
+
+================================================================================
+                    OPEN-SOURCE ATTRIBUTION NOTICE
+================================================================================
+
+HaleHound-CYD was originally derived from the ESP32-DIV project. In
+accordance with the MIT License under which that project was released,
+the following copyright notice is preserved:
+
+  Copyright (c) 2023 CiferTech (original ESP32-DIV)
+
+  Permission is hereby granted, free of charge, to any person obtaining
+  a copy of this software and associated documentation files (the
+  "Software"), to deal in the Software without restriction, including
+  without limitation the rights to use, copy, modify, merge, publish,
+  distribute, sublicense, and/or sell copies of the Software, and to
+  permit persons to whom the Software is furnished to do so, subject to
+  the following conditions:
+
+  The above copyright notice and this permission notice shall be
+  included in all copies or substantial portions of the Software.
+
+  THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
+  EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+  MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.
+
+NOTE: The original ESP32-DIV code has been extensively rewritten,
+expanded, and refactored for the HaleHound-CYD Edition. The MIT License
+above applies to the original ESP32-DIV components. All HaleHound-CYD
+additions, modifications, and new features are the proprietary work of
+Jesse C. Hale and are governed by the Proprietary License above.
+
+THIRD-PARTY COMPONENTS:
+The compiled firmware incorporates components from the following
+open-source projects. Users are responsible for compliance with all
+applicable third-party licenses:
+
+  - ESP32 Arduino Core (LGPL)
+  - TFT_eSPI library (Bodmer, FreeBSD)
+  - RCSwitch library (sui77, LGPL)
+  - RF24 library (nRF24, GPL-2.0)
+  - TinyGPSPlus library (mikalhart, LGPL)
+  - ArduinoJson library (bblanchon, MIT)
+  - SmartRC-CC1101-Driver-Lib (LSatan, LGPL)
+  - ESP-IDF components (Apache 2.0)
+
+
+================================================================================
+                            SCOPE OF LICENSE
+================================================================================
+
+This license applies to all contents of this repository, including:
+
+  - Compiled firmware binaries (.bin files)
+  - Flash packages and partition tables
+  - Documentation and README files
+  - ASCII art and branding assets
+  - Any supporting files included in the repository
 
 
 ================================================================================
@@ -136,88 +206,6 @@ HALEHOUND-CYD FEATURES:
 
 
 ================================================================================
-                            SCOPE OF LICENSE
-================================================================================
-
-This license applies to all contents of this repository, including but not
-limited to:
-
-  - All firmware source code (.cpp, .h, .ino files)
-  - Configuration files and build scripts
-  - Documentation and README files
-  - Hardware pin mappings and schematics references
-  - Menu definitions and UI assets
-  - Supporting libraries developed for this project
-  - ASCII art and branding assets
-
-THIRD-PARTY COMPONENTS:
-This project builds upon and includes components from various open-source
-projects. Where applicable, individual files or directories may contain
-their own licensing terms. Notable dependencies include:
-
-  - ESP32 Arduino Core (LGPL)
-  - TFT_eSPI library
-  - RCSwitch library
-  - RF24 library
-  - TinyGPSPlus library
-  - ArduinoJson library
-  - SmartRC-CC1101-Driver-Lib
-  - Various ESP32 peripheral libraries
-
-Users are responsible for compliance with all applicable third-party licenses.
-
-
-================================================================================
-                        ATTRIBUTION REQUIREMENTS
-================================================================================
-
-When using, modifying, or distributing this software, the following
-attribution requirements apply:
-
-HALEHOUND-CYD ATTRIBUTION:
-  - Jesse C. Hale (JesseCHale) developed the HaleHound-CYD Edition
-  - HaleHound-CYD: https://github.com/JesseCHale/HaleHound-CYD
-
-FOR DIRECT USE:
-  - Retain this LICENSE file in any distribution
-  - Maintain copyright notices in source files
-
-FOR MODIFICATIONS AND FORKS:
-  - Include original copyright notice
-  - Clearly indicate modifications made
-  - Suggested attribution format:
-
-    "Based on HaleHound-CYD by Jesse C. Hale"
-    "https://github.com/JesseCHale/HaleHound-CYD"
-
-FOR DERIVATIVE WORKS:
-  - You may create derivative works under the same MIT license
-  - Original attribution chain must be preserved
-  - You may add your own copyright for your modifications
-
-
-================================================================================
-                          CONTRIBUTION TERMS
-================================================================================
-
-By submitting contributions to this repository (via pull requests, issues,
-or other means), you agree to the following:
-
-  1. Your contributions are provided under the same MIT License
-  2. You have the right to submit the contribution
-  3. You grant the project maintainer rights to use, modify, and distribute
-     your contribution as part of this project
-  4. Contributions become part of the collective work and are subject to
-     this license
-
-Contributions are welcome and encouraged. Please ensure your submissions:
-  - Follow the existing code style and structure
-  - Include appropriate documentation
-  - Are tested on compatible hardware when possible
-  - Do not introduce regressions in existing functionality
-
-
-================================================================================
                      DISCLAIMER & RESPONSIBLE USE
 ================================================================================
 
@@ -262,17 +250,17 @@ REGULATORY NOTICE:
 LEGAL NOTICE:
 Unauthorized access to computer systems and wireless networks is a crime in
 most jurisdictions. Jamming or interfering with wireless communications may
-violate federal law (e.g., 47 U.S.C. § 333). Users are solely responsible
+violate federal law (e.g., 47 U.S.C. SS 333). Users are solely responsible
 for ensuring compliance with all applicable laws and regulations.
 
-The author(s) assume NO LIABILITY for any misuse, damage, or legal
-consequences arising from the use of this software or hardware.
+The author assumes NO LIABILITY for any misuse, damage, or legal
+consequences arising from the use of this firmware or hardware.
 
-By using this software, you acknowledge that:
+By using this firmware, you acknowledge that:
   - You understand the legal implications of wireless security testing
   - You will obtain proper authorization before any testing
   - You accept full responsibility for your actions
-  - The authors bear no responsibility for unauthorized use
+  - The author bears no responsibility for unauthorized use
   - You will comply with all applicable RF and wireless regulations
 
 
@@ -288,7 +276,7 @@ Improper use may result in:
   - Violation of radio frequency regulations
   - Voiding of hardware warranties
 
-The authors provide no warranty for hardware compatibility or safety.
+The author provides no warranty for hardware compatibility or safety.
 Users assume all risk when flashing and operating this firmware.
 
 SUPPORTED HARDWARE:
