@@ -262,7 +262,7 @@ All external radios share the VSPI bus (GPIO 18/19/23) with the built-in SD card
 └─────────────────┘              └──────────────────┘
 ```
 
-**E32R28T / E32R35T:** CC1101 CS moves to **GPIO 21** (GPIO 27 is backlight on 3.5"). All other pins identical.
+**E32R35T (3.5"):** CC1101 CS moves to **GPIO 21** (GPIO 27 is the backlight on the 3.5"). **E32R28T (2.8"):** CC1101 CS stays on **GPIO 27** (GPIO 21 is the backlight on the 2.8"). All other pins identical.
 
 ### NRF24L01+PA+LNA
 
@@ -320,6 +320,8 @@ All external radios share the VSPI bus (GPIO 18/19/23) with the built-in SD card
 
 **USB Conflict:** GPIO 3 is shared with USB serial RX. Firmware calls Serial.end() during GPS, restores on exit.
 
+**Baud:** 9600 (GT-U7 default). Firmware auto-scans GPIO 3/26/1 in case a unit wired it elsewhere.
+
 ### E07-433M20S PA Module (Optional Amplified SubGHz)
 
 ```
@@ -332,7 +334,7 @@ All external radios share the VSPI bus (GPIO 18/19/23) with the built-in SD card
 │ SCK ─────────────┼──────────────┤ GPIO 18 (VSPI)    │
 │ MOSI ────────────┼──────────────┤ GPIO 23 (VSPI)    │
 │ MISO ────────────┼──────────────┤ GPIO 19 (VSPI)    │
-│ CS ──────────────┼──────────────┤ GPIO 21            │
+│ CS ──────────────┼──────────────┤ GPIO 27/21         │
 │ GDO0 (TX) ───────┼──────────────┤ GPIO 22            │
 │ GDO2 (RX) ───────┼──────────────┤ GPIO 35            │
 │ TX_EN ───────────┼──────────────┤ GPIO 4             │
