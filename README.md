@@ -338,14 +338,16 @@ All external radios share the VSPI bus (GPIO 18/19/23) with the built-in SD card
 ├─────────────────┤              ├──────────────────┤
 │ VCC ─────────────┼──────────────┤ VIN               │
 │ GND ─────────────┼──────────────┤ GND               │
-│ TX ──────────────┼──────────────┤ RX (GPIO 3)       │
-│ RX (not used) ───┼──────────────┤ TX (GPIO 1)       │
+│ TX ──────────────┼──────────────┤ TX (GPIO 1)       │
+│ RX (not used) ───┼──────────────┤ RX (GPIO 3)       │
 └─────────────────┘              └──────────────────┘
 ```
 
-**USB Conflict:** GPIO 3 is shared with USB serial RX. Firmware calls Serial.end() during GPS, restores on exit.
+**Wiring:** GPS **TX → GPIO 1** (the P1 "TX" pin) works on every board. The 3.5" E32R35T and sale units lock GPS **only** on GPIO 1; the 2.8" also tolerates GPIO 3. GPS RX is unused (receive-only) — leave it open.
 
-**Baud:** 9600 (GT-U7 default). Firmware auto-scans GPIO 3/26/1 in case a unit wired it elsewhere.
+**USB Conflict:** GPIO 1/3 are the ESP32's USB-serial UART0 pins. The firmware detaches UART0 (Serial.end()) while GPS runs so the GPS owns the line, then restores it on exit.
+
+**Baud:** 9600 (GT-U7 default). Firmware auto-scans GPIO 1/3/26, so it locks regardless of which pin your board uses.
 
 ### E07-433M20S PA Module (Optional Amplified SubGHz)
 
