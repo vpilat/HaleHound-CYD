@@ -31,6 +31,10 @@
 
 Version **v3.6.1** | By [JesseCHale](https://github.com/JesseCHale) | [HaleHound.com](https://halehound.com)
 
+[![Flash in your browser](https://img.shields.io/badge/%E2%9A%A1%20FLASH%20IN%20YOUR%20BROWSER-flash.halehound.com-ff2d95?style=for-the-badge&labelColor=1a1a1a)](https://flash.halehound.com)
+
+**No install needed.** Chrome or Edge on desktop. Plug in your board, pick it, flash. Done.
+
 ---
 
 ## What Is This
@@ -397,9 +401,8 @@ Flash straight from your browser. Nothing to install.
 
 Open **[flash.halehound.com](https://flash.halehound.com)** in Chrome or Edge on desktop. Safari and phones can't flash.
 
-1. Enter the access code from your order
-2. Plug in your CYD with a data USB cable and pick your board
-3. Hit Connect & Flash, then power cycle when it's done
+1. Plug in your CYD with a data USB cable and pick your board
+2. Hit Connect & Flash, then power cycle when it's done
 
 One shot, every time — bootloader, partitions, and app, always the latest build.
 
