@@ -391,37 +391,17 @@ FAT32 formatted MicroSD. Nothing is required — every module handles missing fo
 
 ---
 
-## Flash — Pre-Compiled Binaries
+## Flash — Web Flasher
 
-Pre-built firmware is in the `flash_package/` folder. One binary per board.
+Flash straight from your browser. Nothing to install.
 
-### Easiest Method
+Open **[flash.halehound.com](https://flash.halehound.com)** in Chrome or Edge on desktop. Safari and phones can't flash.
 
-Flash `HaleHound-<board>-FULL.bin` at address `0x0`.
+1. Enter the access code from your order
+2. Plug in your CYD with a data USB cable and pick your board
+3. Hit Connect & Flash, then power cycle when it's done
 
-### Web Flasher (No Install)
-
-1. Open [esp.huhn.me](https://esp.huhn.me) in Chrome/Edge/Opera
-2. Connect → select your CYD serial port
-3. Set address `0x0`, select the FULL.bin for your board
-4. Program → power cycle
-
-### esptool
-
-```bash
-esptool.py --chip esp32 --baud 115200 write_flash 0x0 HaleHound-CYD-FULL.bin
-```
-
-### Four-File Method (Fallback)
-
-If single-file gives a black screen:
-
-| Address | File |
-|---------|------|
-| `0x1000` | `bootloader.bin` |
-| `0x8000` | `partitions.bin` |
-| `0xe000` | `boot_app0.bin` |
-| `0x10000` | `HaleHound-<board>.bin` |
+One shot, every time — bootloader, partitions, and app, always the latest build.
 
 ### First Boot
 
